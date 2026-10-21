@@ -259,3 +259,6 @@ html.scanning body > *:not(#scanOverlay) { visibility: hidden; }
 .info-v { font-weight: 600; text-align: right; -webkit-user-select: text; user-select: text; }
 .progress { height: 10px; border-radius: 6px; background: var(--surface2); overflow: hidden; margin: 14px 0 4px; }
 .progress-bar { height: 100%; width: 0; background: var(--accent); transition: width .25s; }
+
+.code-box { margin: 10px 0 4px; padding: 12px; border-radius: 10px; background: var(--surface); border: 1px dashed var(--accent);
+  font-family: ui-monospace, Menlo, monospace; font-size: 13px; word-break: break-all; -webkit-user-select: all; user-select: all; }

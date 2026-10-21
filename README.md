@@ -25,3 +25,12 @@ Chaque modification du code fabrique automatiquement un nouvel APK (onglet **Act
 - `signing/debug.keystore` : clé de signature de test (permet d'installer les mises à jour par-dessus)
 
 Infos des livres : Google Books, catalogue de la BnF et Open Library.
+
+## Serveur en ligne (Supabase)
+
+- Projet Supabase `ma-bibliotheque` (Paris, eu-west-3)
+- `supabase/functions/api/index.ts` : recherche des livres (BnF en priorité, Google Books, Open Library),
+  mémoire partagée des fiches, synchronisation des bibliothèques, sorties prévues
+- Tâche `sorties-chaque-nuit` (pg_cron) : recalcule les sorties de chaque bibliothèque à 6h17 (heure de Paris)
+- Aucun compte : chaque téléphone reçoit un code de bibliothèque (Réglages → En ligne)
+- Facultatif : un secret `GOOGLE_BOOKS_KEY` (clé gratuite Google Books) débloque les dates de sortie à venir

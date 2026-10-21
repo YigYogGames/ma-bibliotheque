@@ -20,8 +20,12 @@
       return Object.assign(defaultState(), JSON.parse(raw));
     } catch (e) { return defaultState(); }
   }
-  function save() {
+  function saveLocal() {
     try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { toast("Impossible d'enregistrer"); }
+  }
+  function save() {
+    saveLocal();
+    if (typeof scheduleSync === 'function') scheduleSync();
   }
 
   // ---------- Outils ----------
@@ -141,32 +145,113 @@
   }
 
   // --- Source 2 : catalogue de la Bibliothèque nationale de France (tous les livres publiés en France)
-  async function bnfSearch(cql, max = 5) {
-    const xml = await httpGet('https://catalogue.bnf.fr/api/SRU?version=1.2&operation=searchRetrieve&query=' + encodeURIComponent(cql) + '&recordSchema=dublincore&maximumRecords=' + max, 12000);
-    const doc = new DOMParser().parseFromString(xml, 'text/xml');
-    if (!doc.getElementsByTagNameNS('*', 'searchRetrieveResponse').length && !doc.getElementsByTagNameNS('*', 'records').length) throw new Error('réponse illisible');
-    return Array.from(doc.getElementsByTagNameNS('*', 'dc')).map(parseBnfRec).filter(Boolean);
+  // ---------- BnF : format UNIMARC (champs structurés : série, tome, titre, auteurs…) ----------
+  const xmlDecode = (s) => String(s).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n)).replace(/&amp;/g, '&').trim();
+  function marcFields(rec, tag) {
+    const out = [];
+    const re = new RegExp('<mxc:datafield tag="' + tag + '"[^>]*>([\\s\\S]*?)</mxc:datafield>', 'g');
+    let m;
+    while ((m = re.exec(rec))) {
+      const f = {};
+      const sre = /<mxc:subfield code="(.)">([\s\S]*?)<\/mxc:subfield>/g;
+      let s;
+      while ((s = sre.exec(m[1]))) (f[s[1]] = f[s[1]] || []).push(xmlDecode(s[2]));
+      out.push(f);
+    }
+    return out;
   }
-  function parseBnfRec(rec) {
-    const all = (tag) => Array.from(rec.getElementsByTagNameNS('*', tag)).map((n) => n.textContent.trim()).filter(Boolean);
-    const rawTitle = all('title')[0] || '';
-    if (!rawTitle) return null;
-    // « One piece. 1, À l'aube d'une grande aventure / Eiichiro Oda ; trad. … »
-    const [titlePart, resp = ''] = rawTitle.split(' / ');
-    let series = '', volume = null, title = titlePart.replace(/\s*\[[^\]]*\]\s*/g, ' ').trim();
-    const m = title.match(/^(.+?)\.\s*(?:tome|t\.|vol(?:ume)?\.?)?\s*(\d{1,4})\b\s*[,.:]?\s*(.*)$/i);
-    if (m) { series = m[1].trim(); volume = +m[2]; title = series + ' – Tome ' + volume + (m[3] ? ' – ' + m[3].trim() : ''); }
-    else { const ps = parseSeries(title); series = ps.series; volume = ps.volume; }
-    let authors = all('creator').map((c) => c.replace(/\(.*?\)/g, '').replace(/\..*$/, '').trim())
-      .map((c) => { const p = c.split(',').map((x) => x.trim()); return p.length === 2 ? p[1] + ' ' + p[0] : c; });
-    if (!authors.length && resp) authors = [resp.split(';')[0].trim()];
-    const pub = (all('publisher')[0] || '').replace(/\s*\(.*?\)\s*/g, '').trim();
-    const date = (all('date')[0] || '').match(/\d{4}/);
-    const ids = all('identifier');
-    const ark = (ids.join(' ').match(/ark:\/12148\/[a-z0-9]+/i) || [])[0] || '';
-    const isbnM = ids.join(' ').replace(/-/g, '').match(/97[89]\d{10}/);
-    return { isbn: isbnM ? isbnM[0] : '', title, authors: [...new Set(authors)].join(', '), publisher: pub,
-      publishedDate: date ? date[0] : '', pages: null, description: '', cover: '', series, volume, ark };
+  const sub = (f, c) => (f && f[c] && f[c][0]) || '';
+  const volNum = (v) => { const m = String(v || '').match(/(\d{1,4})/); return m ? +m[1] : null; };
+  function parseUnimarc(rec) {
+    const ark = ((rec.match(/<srw:recordIdentifier>([^<]+)<\/srw:recordIdentifier>/) || [])[1] || '').trim();
+    const t200 = marcFields(rec, '200')[0];
+    if (!t200) return null;
+    const kind = sub(t200, 'b');
+    if (kind && !/texte/i.test(kind)) return null; // DVD, musique… : on ignore
+    const main = sub(t200, 'a').replace(/\s+/g, ' ');
+    let series = '', volume = null;
+    const s461 = marcFields(rec, '461').find((f) => sub(f, 't') && volNum(sub(f, 'v')));
+    // 225 = collection de l'éditeur (« Folio junior ; 100ème ») OU vraie série (« One piece ; tome 1 »)
+    const isSeries225 = (f) => sub(f, 'a') && volNum(sub(f, 'v')) &&
+      (/tome|vol|t\.|livre|partie|cycle|épisode|episode|n°/i.test(sub(f, 'v')) || norm(main).includes(norm(sub(f, 'a'))));
+    const s225 = marcFields(rec, '225').find(isSeries225);
+    const colls = marcFields(rec, '225').filter((f) => !isSeries225(f)).map((f) => norm(sub(f, 'a'))).filter(Boolean)
+      .concat(marcFields(rec, '410').map((f) => norm(sub(f, 't'))).filter(Boolean));
+    if (s461) { series = sub(s461, 't'); volume = volNum(sub(s461, 'v')); }
+    else if (s225) { series = sub(s225, 'a'); volume = volNum(sub(s225, 'v')); }
+    else if (volNum(sub(t200, 'h'))) { series = main; volume = volNum(sub(t200, 'h')); }
+    const part = sub(t200, 'i') || (series && norm(main) !== norm(series) ? main : '');
+    const subt = sub(t200, 'e');
+    let title;
+    if (series && volume) title = series + ' – Tome ' + volume + (part ? ' – ' + part : '');
+    else {
+      title = main + (subt ? ' : ' + subt : '');
+      const ps = parseSeries(main, sub(t200, 'h'));
+      if (ps.series) { series = ps.series; volume = ps.volume; }
+    }
+    const authors = marcFields(rec, '700').concat(marcFields(rec, '701'))
+      .map((f) => (sub(f, 'b') + ' ' + sub(f, 'a')).trim()).filter(Boolean);
+    const pubF = marcFields(rec, '214')[0] || marcFields(rec, '210')[0];
+    const year = (sub(pubF, 'd').match(/\d{4}/) || [])[0] || '';
+    const isbn = (sub(marcFields(rec, '073')[0], 'a') || sub(marcFields(rec, '010')[0], 'a')).replace(/[^0-9X]/gi, '');
+    const pages = +((sub(marcFields(rec, '215')[0], 'a').match(/(\d+)\s*p\./) || [])[1] || 0) || null;
+    const hasCover = marcFields(rec, '856').some((f) => /couverture/i.test(sub(f, 'b')));
+    const price = parseFloat((sub(marcFields(rec, '010')[0], 'd').match(/\d+(?:[.,]\d+)?/) || ['0'])[0].replace(',', '.')) || 0;
+    const size = (sub(marcFields(rec, '215')[0], 'd').match(/\d+/) || [''])[0];
+    return {
+      isbn: /^97[89]\d{10}$/.test(isbn) ? isbn : '', title, authors: [...new Set(authors)].join(', '),
+      publisher: sub(pubF, 'c'), publishedDate: year, pages, description: sub(marcFields(rec, '330')[0], 'a'),
+      cover: hasCover && ark ? 'https://catalogue.bnf.fr/couverture?&appName=NE&idArk=' + ark + '&couverture=1' : '',
+      series, volume, ark,
+      // indices pour reconnaître la même édition (format, prix, collection) et écarter les produits dérivés
+      _m: { main: norm(main), sub: norm(subt), colls, price, size },
+    };
+  }
+
+  // Mot principal du nom de l'éditeur (« Éditions Delcourt » -> « delcourt »)
+  function pubWord(p) {
+    const stop = ['editions', 'edition', 'ed', 'les', 'groupe', 'la', 'le', 'de', 'des', 'et'];
+    return norm(p).split(' ').filter((w) => w.length > 2 && !stop.includes(w))[0] || '';
+  }
+  // Recherche BnF d'un tome précis : d'abord chez le même éditeur, sinon partout
+  async function bnfVolumeSearch(series, v, publisher) {
+    const base = 'bib.title all "' + String(series).replace(/"/g, '') + '" and bib.title all "' + v + '"';
+    const pw = pubWord(publisher);
+    let recs = pw ? await bnfSearch(base + ' and bib.publisher all "' + pw + '"', 50) : [];
+    if (!recs.some((r) => r.volume === v && norm(r.series) === norm(series))) recs = recs.concat(await bnfSearch(base, 50));
+    return recs;
+  }
+
+  // Parmi plusieurs notices « Série, tome N », choisit celle qui ressemble le plus au tome de référence
+  function pickVolume(recs, v, key, ref) {
+    const R = (ref && ref._m) || null;
+    const scored = recs.filter((r) => r.volume === v && norm(r.series) === key).map((r) => {
+      const m = r._m || {};
+      let sc = 0;
+      if (r.isbn) sc += 1;
+      if (ref && ref.publisher && r.publisher) sc += pubWord(r.publisher) === pubWord(ref.publisher) ? 3 : -4;
+      // produit dérivé : « One piece » + sous-titre (« color walk », « quiz book »…)
+      if (m.main === key && m.sub && !(R && R.main === key && R.sub)) return null;
+      if (R) {
+        if (R.size && m.size) sc += R.size === m.size ? 3 : -3;
+        if (R.price && m.price) sc += Math.abs(m.price - R.price) / R.price < 0.35 ? 2 : -2;
+        if (R.colls.length && m.colls.some((c) => R.colls.includes(c))) sc += 2;
+        if ((R.main === key) === (m.main === key)) sc += 1; // même façon de titrer les tomes
+      }
+      return { r, sc };
+    }).filter(Boolean).sort((a, b) => b.sc - a.sc);
+    if (!scored.length) return null;
+    return scored[0].sc >= (R ? 3 : 1) ? scored[0].r : null;
+  }
+  function parseBnfResponse(xml) {
+    if (!/searchRetrieveResponse/.test(xml)) throw new Error('réponse illisible');
+    return (xml.match(/<srw:record>[\s\S]*?<\/srw:record>/g) || []).map(parseUnimarc).filter(Boolean);
+  }
+
+  async function bnfSearch(cql, max = 5) {
+    const xml = await httpGet('https://catalogue.bnf.fr/api/SRU?version=1.2&operation=searchRetrieve&query=' + encodeURIComponent(cql) + '&recordSchema=unimarcxchange&maximumRecords=' + max, 12000);
+    return parseBnfResponse(xml);
   }
   async function srcBnf(isbn) {
     const r = await bnfSearch('bib.isbn all "' + isbn + '"', 3);
@@ -189,8 +274,40 @@
     };
   }
 
+  // ---------- Serveur en ligne ----------
+  const API = 'https://zfniddtlcgnmvserapql.supabase.co/functions/v1/api';
+  async function api(action, payload = {}, timeoutMs = 25000) {
+    const body = Object.assign({ action }, payload);
+    const H = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.CapacitorHttp;
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('serveur trop lent')), timeoutMs));
+    let status, data;
+    if (isNative() && H && H.post) {
+      const r = await Promise.race([H.post({ url: API, headers: { 'Content-Type': 'application/json' }, data: body, connectTimeout: timeoutMs, readTimeout: timeoutMs }), timeout]);
+      status = r.status; data = typeof r.data === 'string' ? JSON.parse(r.data || '{}') : r.data;
+    } else {
+      const r = await Promise.race([fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }), timeout]);
+      status = r.status; data = await r.json();
+    }
+    if (status < 200 || status >= 300) { const e = new Error((data && data.error) || 'erreur ' + status); e.status = status; throw e; }
+    return data;
+  }
+  const stripV = (b) => { if (b) { delete b.v; } return b; };
+
   let lastLookupReport = [];
   async function lookupIsbn(raw, onStatus) {
+    let isbn = cleanIsbn(raw);
+    if (isbn.length === 10) isbn = isbn10to13(isbn);
+    try {
+      const r = await api('lookup', { isbn }, 30000);
+      lastLookupReport = (r.report || []).concat(['serveur : OK']);
+      if (r.book) return stripV(r.book);
+      if (!r.networkError) return null; // les catalogues ne connaissent pas ce livre
+    } catch (e) {
+      onStatus && onStatus('Serveur indisponible, recherche directe…');
+    }
+    return lookupIsbnLocal(isbn, onStatus);
+  }
+  async function lookupIsbnLocal(raw, onStatus) {
     let isbn = cleanIsbn(raw);
     if (isbn.length === 10) isbn = isbn10to13(isbn);
     const sources = [['Google Books', srcGoogle, 3], ['BnF', srcBnf, 3], ['Open Library', srcOpenLibrary, 2]];
@@ -221,14 +338,19 @@
       // la BnF découpe très bien « Série. N° » : on la préfère pour la série
       series: (bnf && bnf.series) || pick('series'), volume: (bnf && bnf.volume) || pick('volume'),
     };
-    if (bnf && bnf.series && bnf.volume && !/tome|t\.|vol/i.test(b.title)) b.title = bnf.title;
+    if (bnf && bnf.series && bnf.volume) b.title = bnf.title;
+    if (bnf && bnf.description && !b.description) b.description = bnf.description;
     return b;
   }
 
   // Couverture cherchée en arrière-plan : l'écran s'affiche tout de suite, l'image arrive ensuite
+  async function findCoverAny(isbn, ark) {
+    try { const r = await api('cover', { isbn, ark }, 30000); if (r.cover) return r.cover; } catch (e) { /* recherche directe */ }
+    return findCover(isbn, ark);
+  }
   function coverLater(b) {
-    if (!b.isbn || b.coverPhoto) return;
-    findCover(b.isbn, b.ark).then((u) => {
+    if (!b.isbn || b.coverPhoto || b.cover) return;
+    findCoverAny(b.isbn, b.ark).then((u) => {
       if (!u) return;
       b.cover = u; b.coverTriedAt = Date.now();
       const pv = $('#previewCover'); if (pv) pv.innerHTML = coverHTML(b);
@@ -315,7 +437,7 @@
     const todo = state.books.filter((b) => !b.cover && b.isbn && (!b.coverTriedAt || Date.now() - b.coverTriedAt > 3 * 864e5));
     let fixed = 0;
     for (const b of todo.slice(0, 15)) {
-      const u = await findCover(b.isbn, b.ark).catch(() => '');
+      const u = await findCoverAny(b.isbn, b.ark).catch(() => '');
       b.coverTriedAt = Date.now();
       if (u) { b.cover = u; fixed++; }
       save();
@@ -344,6 +466,23 @@
     $('#viewTitle').textContent = TITLES[view];
     window.scrollTo(0, 0);
     render();
+    if (view === 'releases') autoLoadReleases();
+  }
+  // En ouvrant « Sorties » : si la liste n'a pas été chargée depuis 6 h (ou jamais), on la demande au serveur
+  let releasesLoading = false;
+  function autoLoadReleases() {
+    if (releasesLoading || !seriesList().length) return;
+    const fresh = state.releasesFromServer && Date.now() - (state.lastCheck || 0) < 6 * 3600e3 && state.lastCheckSeries === seriesKeySig();
+    if (fresh) return;
+    releasesLoading = true;
+    $('#lastCheck').textContent = 'Recherche des sorties de tes séries sur le serveur…';
+    loadServerReleases(false).then(() => { state.lastCheckSeries = seriesKeySig(); saveLocal(); })
+      .catch(() => { $('#lastCheck').textContent = 'Serveur indisponible : appuie sur « Chercher les nouveautés »'; })
+      .finally(() => { releasesLoading = false; if (currentView === 'releases') renderReleases(); });
+  }
+  // Signature des séries possédées (avec le dernier tome) : si elle change, on recalcule les sorties
+  function seriesKeySig() {
+    return seriesList().map((s) => s.key + ':' + Math.max(0, ...s.books.map((b) => b.volume || 0))).join('|');
   }
 
   // ---------- Rendu ----------
@@ -470,8 +609,10 @@
   function renderReleases() {
     const el = $('#releasesContent');
     const rp = state.lastReport;
-    const rpTxt = rp ? ` · Google Books : ${rp.google.err ? rp.google.err + ' échec(s)' + (rp.google.last ? ' (' + rp.google.last + ')' : '') : 'OK'} · BnF : ${rp.bnf.err ? rp.bnf.err + ' échec(s)' + (rp.bnf.last ? ' (' + rp.bnf.last + ')' : '') : 'OK'}` : '';
-    $('#lastCheck').textContent = state.lastCheck ? 'Dernière recherche : ' + new Date(state.lastCheck).toLocaleString('fr-FR', { dateStyle: 'medium', timeStyle: 'short' }) + rpTxt : '';
+    const srcTxt = (name, x) => !x ? '' : (x.ok ? name + ' OK' : (x.err ? name + ' indisponible' + (x.last ? ' (' + x.last + ')' : '') : ''));
+    const rpTxt = rp ? ' · ' + [srcTxt('BnF', rp.bnf), srcTxt('Google Books', rp.google)].filter(Boolean).join(' · ') : '';
+    const auto = state.releasesFromServer ? ' · mise à jour automatique chaque nuit' : '';
+    $('#lastCheck').textContent = state.lastCheck ? 'Dernière recherche : ' + new Date(state.lastCheck).toLocaleString('fr-FR', { dateStyle: 'medium', timeStyle: 'short' }) + auto + rpTxt : '';
     if (!seriesList().length) {
       el.innerHTML = `<div class="empty"><div class="big">📅</div><h2>Pas encore de série</h2><p>Ajoute des livres qui font partie d'une série, puis reviens ici : je chercherai les prochains tomes et leurs dates de sortie.</p></div>`;
       return;
@@ -511,6 +652,7 @@
   }
 
   function renderSettings() {
+    renderSyncStatus();
     $$('.theme-chip').forEach((c) => c.classList.toggle('active', c.dataset.themePick === state.settings.theme));
   }
 
@@ -647,14 +789,13 @@
   }
 
   // Cherche les infos d'un tome précis d'une série (BnF puis Google), sans ISBN
+  const bnfRefCache = new WeakMap(); // notice BnF du tome de référence (sans l'enregistrer dans le livre)
   async function findVolume(series, v, ref, gIndex) {
-    const key = norm(series);
-    const sameEd = (pub) => !ref.publisher || !pub || norm(pub).split(' ')[0] === norm(ref.publisher).split(' ')[0];
     try {
-      const recs = await withRetry(() => bnfSearch('bib.title all "' + series.replace(/"/g, '') + '" and bib.title all "' + v + '"', 15), 2);
-      const ok = recs.filter((r) => r.volume === v && norm(r.series) === key);
-      const best = ok.find((r) => sameEd(r.publisher) && r.isbn) || ok.find((r) => r.isbn) || ok[0];
-      if (best) return best;
+      if (ref.isbn && !bnfRefCache.has(ref)) bnfRefCache.set(ref, (await srcBnf(ref.isbn).catch(() => null)) || { publisher: ref.publisher });
+      const recs = await withRetry(() => bnfVolumeSearch(series, v, ref.publisher || ''), 2);
+      const best = pickVolume(recs, v, norm(series), bnfRefCache.get(ref) || ref);
+      if (best) { delete best._m; return best; }
     } catch (e) { /* on essaie Google */ }
     if (gIndex && gIndex.has(v)) return gIndex.get(v);
     return null;
@@ -681,41 +822,51 @@
       <div class="progress"><div class="progress-bar" id="fillBar"></div></div>
       <div class="sheet-actions"><button class="btn ghost block" id="fillStop">Arrêter</button></div>`);
     $('#fillStop').onclick = () => { cancelled = true; };
-    const gIndex = await googleSeriesIndex(ref.series);
     const added = [];
-    const work = missing.slice();
-    const worker = async () => {
-      while (work.length && !cancelled) {
-        const v = work.shift();
-        const info = await findVolume(ref.series, v, ref, gIndex).catch(() => null);
-        if (cancelled) break;
-        // un livre ajouté entre-temps avec le même ISBN ? on évite les doublons
-        if (info && info.isbn && state.books.some((x) => x.isbn === info.isbn)) {
-          const ex = state.books.find((x) => x.isbn === info.isbn);
-          if (ex.volume === v && norm(ex.series) === norm(ref.series)) { done++; continue; }
-          info.isbn = ''; // fiche douteuse : on garde le tome mais sans cet ISBN
-        }
-        const nb = {
-          id: uid(), addedAt: Date.now() - (ref.volume - v), // garde l'ordre des tomes dans « Ajout récent »
-          isbn: (info && info.isbn) || '', ark: (info && info.ark) || '',
-          title: (info && info.title) || (ref.series + ' – Tome ' + v),
-          authors: (info && info.authors) || ref.authors || '', publisher: (info && info.publisher) || ref.publisher || '',
-          publishedDate: (info && info.publishedDate) || '', pages: (info && info.pages) || null,
-          description: (info && info.description) || '', cover: (info && info.cover) || '',
-          series: ref.series, volume: v,
-        };
-        if (info) withInfo++;
-        state.books.push(nb); added.push(nb);
-        done++;
-        const st = $('#fillStatus'); if (st) st.textContent = `Tome ${v} ajouté — ${done}/${missing.length}`;
-        const bar = $('#fillBar'); if (bar) bar.style.width = Math.round((done / missing.length) * 100) + '%';
-        save();
+    let gIndex = null, serverOk = true;
+    const addVolume = (v, info) => {
+      // un livre ajouté entre-temps avec le même ISBN ? on évite les doublons
+      if (info && info.isbn && state.books.some((x) => x.isbn === info.isbn)) {
+        const ex = state.books.find((x) => x.isbn === info.isbn);
+        if (ex.volume === v && norm(ex.series) === norm(ref.series)) { done++; return; }
+        info.isbn = ''; // fiche douteuse : on garde le tome mais sans cet ISBN
       }
+      const nb = {
+        id: uid(), addedAt: Date.now() - (ref.volume - v), // garde l'ordre des tomes dans « Ajout récent »
+        isbn: (info && info.isbn) || '', ark: (info && info.ark) || '',
+        title: (info && info.title) || (ref.series + ' – Tome ' + v),
+        authors: (info && info.authors) || ref.authors || '', publisher: (info && info.publisher) || ref.publisher || '',
+        publishedDate: (info && info.publishedDate) || '', pages: (info && info.pages) || null,
+        description: (info && info.description) || '', cover: (info && info.cover) || '',
+        series: ref.series, volume: v,
+      };
+      if (info) withInfo++;
+      state.books.push(nb); added.push(nb);
+      done++;
+      const st = $('#fillStatus'); if (st) st.textContent = `Tome ${v} ajouté — ${done}/${missing.length}`;
+      const bar = $('#fillBar'); if (bar) bar.style.width = Math.round((done / missing.length) * 100) + '%';
     };
-    await Promise.all([worker(), worker(), worker()]); // 3 tomes cherchés en même temps
+    // Le serveur cherche les tomes par paquets de 12 (bien plus rapide) ; sinon, recherche directe tome par tome
+    for (let i = 0; i < missing.length && !cancelled; i += 12) {
+      const chunk = missing.slice(i, i + 12);
+      const st0 = $('#fillStatus'); if (st0) st0.textContent = `Recherche des tomes ${chunk[0]} à ${chunk[chunk.length - 1]}… (${done}/${missing.length})`;
+      let infos = null;
+      if (serverOk) {
+        try { infos = (await api('volumes', { series: ref.series, volumes: chunk, publisher: ref.publisher || '', refIsbn: ref.isbn || '' }, 140000)).volumes || {}; }
+        catch (e) { serverOk = false; }
+      }
+      if (cancelled) break;
+      if (!infos) {
+        if (!gIndex) gIndex = await googleSeriesIndex(ref.series);
+        infos = {};
+        await Promise.all(chunk.map(async (v) => { infos[v] = await findVolume(ref.series, v, ref, gIndex).catch(() => null); }));
+      }
+      for (const v of chunk) { if (!cancelled) addVolume(v, stripV(infos[v]) || null); }
+      save();
+    }
     save(); render();
     // Couvertures : l'une après l'autre, en arrière-plan
-    (async () => { for (const nb of added) { if (!nb.cover && nb.isbn) { const u = await findCover(nb.isbn, nb.ark).catch(() => ''); nb.coverTriedAt = Date.now(); if (u) { nb.cover = u; save(); render(); } } } })();
+    (async () => { for (const nb of added) { if (!nb.cover && nb.isbn) { const u = await findCoverAny(nb.isbn, nb.ark).catch(() => ''); nb.coverTriedAt = Date.now(); if (u) { nb.cover = u; save(); render(); } } } })();
     openSheet(`<h2>✅ ${added.length} tome${added.length > 1 ? 's' : ''} ajouté${added.length > 1 ? 's' : ''}</h2>
       <p class="muted">${esc(ref.series)} : tu as maintenant les tomes 1 à ${ref.volume}${cancelled ? ' (ajout arrêté en cours de route)' : ''}.</p>
       ${withInfo < added.length ? `<p class="muted small">${added.length - withInfo} tome${added.length - withInfo > 1 ? 's' : ''} sans fiche détaillée trouvée : ils sont ajoutés avec le nom de la série et leur numéro.</p>` : ''}
@@ -1003,11 +1154,132 @@
     };
     if ($('#cvSearch')) $('#cvSearch').onclick = async () => {
       $('#cvSearch').textContent = 'Recherche…'; $('#cvSearch').disabled = true;
-      const u = await findCover(b.isbn, b.ark).catch(() => '');
+      const u = await findCoverAny(b.isbn, b.ark).catch(() => '');
       if (u) { b.cover = u; b.coverPhoto = false; save(); render(); toast('Couverture trouvée 🎉'); onDone(); }
       else { toast('Aucune couverture trouvée, essaie une photo'); $('#cvSearch').textContent = '🔎 Chercher automatiquement'; $('#cvSearch').disabled = false; }
     };
     if ($('#cvRemove')) $('#cvRemove').onclick = () => { b.cover = ''; save(); render(); onDone(); };
+  }
+
+  // ---------- Synchronisation en ligne (sauvegarde automatique) ----------
+  function hashStr(str) { let h = 5381; for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0; return (h >>> 0).toString(36) + '.' + str.length.toString(36); }
+  const bookHash = (b) => { const { updatedAt, ...rest } = b; return hashStr(JSON.stringify(rest)); };
+  let syncTimer = null, syncing = false, syncAgain = false;
+  function scheduleSync(ms = 2500) { clearTimeout(syncTimer); syncTimer = setTimeout(() => syncNow().catch(() => {}), ms); }
+  async function ensureLibrary() {
+    if (!state.sync) state.sync = {};
+    if (state.sync.id) return;
+    const r = await api('register', {}, 20000);
+    state.sync = { id: r.id, secret: r.secret, snap: {} };
+    saveLocal();
+  }
+  async function syncNow() {
+    if (syncing) { syncAgain = true; return; }
+    syncing = true;
+    try {
+      await ensureLibrary();
+      const snap = state.sync.snap || {};
+      const now = Date.now();
+      const local = new Map(state.books.map((b) => [b.id, b]));
+      const changes = [];
+      for (const b of state.books) {
+        if (snap[b.id] !== bookHash(b)) { b.updatedAt = now; changes.push({ book_id: b.id, updated_at: now, data: b }); }
+      }
+      for (const id of Object.keys(snap)) if (!local.has(id)) changes.push({ book_id: id, deleted: true, updated_at: now });
+      const r = await api('sync', { id: state.sync.id, secret: state.sync.secret, changes }, 60000);
+      let changed = false;
+      for (const row of r.books || []) {
+        const loc = local.get(row.book_id);
+        if (row.deleted) {
+          if (loc && (loc.updatedAt || 0) <= row.updated_at) { state.books = state.books.filter((x) => x !== loc); changed = true; }
+          continue;
+        }
+        if (!row.data) continue;
+        if (!loc) { state.books.push(Object.assign({}, row.data, { id: row.book_id, updatedAt: row.updated_at })); changed = true; }
+        else if (row.updated_at > (loc.updatedAt || 0)) {
+          for (const k of Object.keys(loc)) delete loc[k];
+          Object.assign(loc, row.data, { id: row.book_id, updatedAt: row.updated_at }); changed = true;
+        }
+      }
+      const newSnap = {};
+      for (const b of state.books) newSnap[b.id] = bookHash(b);
+      state.sync.snap = newSnap; state.sync.last = Date.now(); state.sync.error = '';
+      saveLocal();
+      if (changed && !scanner.active) render();
+    } catch (e) {
+      if (!state.sync) state.sync = {};
+      state.sync.error = e.status === 401 ? 'code de bibliothèque refusé' : 'hors ligne';
+      saveLocal();
+    } finally {
+      syncing = false;
+      renderSyncStatus();
+      if (syncAgain) { syncAgain = false; scheduleSync(500); }
+    }
+  }
+  function libraryCode() { return state.sync && state.sync.id ? state.sync.id + '.' + state.sync.secret : ''; }
+  function renderSyncStatus() {
+    const el = $('#syncStatus'); if (!el) return;
+    const sy = state.sync || {};
+    if (sy.last && !sy.error) el.innerHTML = '✅ Ta bibliothèque est sauvegardée en ligne — dernière synchro : ' + new Date(sy.last).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' });
+    else if (sy.error) el.innerHTML = '⚠️ Pas de synchro pour l’instant (' + esc(sy.error) + '). Tes livres restent sur le téléphone et seront envoyés dès que possible.';
+    else el.textContent = 'Connexion au serveur…';
+  }
+  function showLibraryCode() {
+    const code = libraryCode();
+    if (!code) { toast('Synchro pas encore faite, réessaie dans un instant'); syncNow(); return; }
+    openSheet(`<h2>Code de ma bibliothèque</h2>
+      <p class="muted small">Ce code permet de retrouver ta bibliothèque sur un autre téléphone (ou sur iPhone plus tard). Garde-le pour toi : quiconque l’a peut voir et modifier ta bibliothèque.</p>
+      <div class="code-box" id="codeBox">${esc(code)}</div>
+      <div class="sheet-actions">
+        <button class="btn primary block" id="copyCode">Copier le code</button>
+        <button class="btn block" id="shareCode">Partager / l’envoyer</button>
+        <button class="btn ghost block" data-act="close">Fermer</button>
+      </div>`);
+    $('#copyCode').onclick = async () => { try { await navigator.clipboard.writeText(code); toast('Code copié'); } catch (e) { toast('Sélectionne le code et copie-le'); } };
+    $('#shareCode').onclick = async () => {
+      const P = window.Capacitor && window.Capacitor.Plugins;
+      try {
+        if (isNative() && P && P.Share) await P.Share.share({ title: 'Code Ma Bibliothèque', text: code });
+        else if (navigator.share) await navigator.share({ text: code });
+        else { await navigator.clipboard.writeText(code); toast('Code copié'); }
+      } catch (e) { /* annulé */ }
+    };
+  }
+  function useOtherCode() {
+    openSheet(`<h2>Utiliser une autre bibliothèque</h2>
+      <p class="muted small">Colle le code d’une bibliothèque existante (par exemple celle de ton ancien téléphone). Les livres de ce téléphone y seront ajoutés, rien n’est perdu.</p>
+      <form class="form" id="codeForm"><input type="text" name="code" placeholder="xxxxxxxx-xxxx-….xxxxxxxx" autocomplete="off">
+      <div class="sheet-actions"><button class="btn primary block" type="submit">Relier cette bibliothèque</button>
+      <button class="btn ghost block" type="button" data-act="close">Annuler</button></div></form>`);
+    $('#codeForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const code = String(new FormData(e.target).get('code') || '').trim();
+      const m = code.match(/^([0-9a-f-]{36})\.([0-9a-f]{20,})$/i);
+      if (!m) return toast('Ce code n’a pas le bon format');
+      const before = state.sync;
+      state.sync = { id: m[1].toLowerCase(), secret: m[2].toLowerCase(), snap: {} };
+      saveLocal(); closeSheet(); toast('Connexion à la bibliothèque…');
+      await syncNow();
+      if (state.sync.error) { toast('Code refusé, rien n’a changé', 3500); state.sync = before; saveLocal(); renderSyncStatus(); return; }
+      toast('Bibliothèque reliée 🎉'); render(); loadServerReleases(false).catch(() => {});
+    };
+  }
+
+  // ---------- Sorties calculées par le serveur (chaque nuit, ou à la demande) ----------
+  async function loadServerReleases(refresh) {
+    await syncNow();
+    if (!state.sync || !state.sync.id || state.sync.error) throw new Error('serveur indisponible');
+    if (state.lastCheckSeries && state.lastCheckSeries !== seriesKeySig()) refresh = true;
+    const r = await api('releases', { id: state.sync.id, secret: state.sync.secret, refresh: !!refresh }, 150000);
+    state.lastCheckSeries = seriesKeySig();
+    if (!r) return;
+    const manual = state.releases.filter((x) => x.manual);
+    state.releases = manual.concat((r.releases || []).filter((f) => !manual.some((m) => relKey(m) === relKey(f))));
+    state.lastCheck = r.checked_at ? new Date(r.checked_at).getTime() : Date.now();
+    state.lastReport = r.report || null;
+    state.releasesFromServer = true;
+    saveLocal();
+    if (!scanner.active) render();
   }
 
   // ---------- Recherche des sorties ----------
@@ -1043,7 +1315,7 @@
       for (const v of [maxOwned + 1, maxOwned + 2]) {
         try {
           const recs = await withRetry(() => bnfSearch('bib.title all "' + s.name.replace(/"/g, '') + '" and bib.title all "' + v + '"', 10), 2);
-          for (const r of recs) if (r.volume === v) keep({ series: s.name, volume: r.volume, title: r.title, date: r.publishedDate, isbn: r.isbn, cover: '', out: true, _s: r.series });
+          for (const r of recs) if (r.volume === v) keep({ series: s.name, volume: r.volume, title: r.title, date: r.publishedDate, isbn: r.isbn, cover: r.cover || '', out: true, _s: r.series });
           report.bnf.ok++;
         } catch (e) { report.bnf.err++; report.bnf.last = String(e.message || e); }
         await sleep(250);
@@ -1053,10 +1325,23 @@
   }
 
   async function checkReleases() {
+    if (!seriesList().length) { toast('Ajoute d’abord des livres d’une série'); return; }
+    const btn = $('#checkReleasesBtn');
+    btn.disabled = true; btn.textContent = 'Recherche en cours…';
+    try {
+      await loadServerReleases(true);
+      btn.disabled = false; btn.textContent = '↻ Chercher les nouveautés';
+      const n = visibleReleases().length;
+      toast(n ? `${n} tome${n > 1 ? 's' : ''} trouvé${n > 1 ? 's' : ''} pour tes séries 🎉` : 'Rien de nouveau pour l’instant');
+      return;
+    } catch (e) { /* serveur indisponible : recherche directe depuis le téléphone */ }
+    return checkReleasesLocal();
+  }
+  async function checkReleasesLocal() {
     const series = seriesList();
-    if (!series.length) { toast('Ajoute d’abord des livres d’une série'); return; }
     const btn = $('#checkReleasesBtn');
     btn.disabled = true;
+    state.releasesFromServer = false;
     const keepManual = state.releases.filter((r) => r.manual);
     const found = [];
     const report = { google: { ok: 0, err: 0, last: '' }, bnf: { ok: 0, err: 0, last: '' } };
@@ -1161,6 +1446,9 @@
       openSheet(bookForm(b, { isNew: true })); wireBookForm(b, true);
     });
     $('#exportBtn').addEventListener('click', exportData);
+    $('#syncNowBtn').addEventListener('click', async () => { toast('Synchronisation…'); await syncNow(); toast(state.sync && !state.sync.error ? 'Synchronisé ✅' : 'Pas de connexion au serveur'); });
+    $('#showCodeBtn').addEventListener('click', showLibraryCode);
+    $('#useCodeBtn').addEventListener('click', useOtherCode);
     $('#importBtn').addEventListener('click', () => $('#importFile').click());
     $('#importFile').addEventListener('change', (e) => { if (e.target.files[0]) importData(e.target.files[0]); e.target.value = ''; });
 
@@ -1194,6 +1482,9 @@
     // Bouton « retour » d'Android : ferme la fenêtre ouverte, sinon revient aux livres
     const App = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
     if (App && App.addListener) {
+      App.addListener('resume', () => {
+        syncNow().then(() => { if (seriesList().length && Date.now() - (state.lastCheck || 0) > 6 * 3600e3) return loadServerReleases(false); }).catch(() => {});
+      });
       App.addListener('backButton', () => {
         if (scanner.active || $('#scanOverlay')) finishScan();
         else if (!$('#sheetBackdrop').hidden) closeSheet();
@@ -1212,10 +1503,10 @@
   // Couvertures manquantes
   setTimeout(() => repairCovers().catch(() => {}), 1500);
 
-  // Recherche automatique des sorties une fois par semaine
-  if (seriesList().length && (!state.lastCheck || Date.now() - state.lastCheck > 7 * 864e5)) {
-    setTimeout(() => checkReleases().catch(() => {}), 2500);
-  }
+  // Synchro en ligne, puis sorties (calculées par le serveur chaque nuit)
+  setTimeout(() => {
+    syncNow().then(() => { if (seriesList().length) return loadServerReleases(false); }).catch(() => {});
+  }, 800);
 
   // Pour les tests
   window.__biblio = { parseSeries, state: () => state };
