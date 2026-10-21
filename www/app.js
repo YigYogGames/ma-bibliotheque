@@ -194,12 +194,19 @@
     let isbn = cleanIsbn(raw);
     if (isbn.length === 10) isbn = isbn10to13(isbn);
     const sources = [['Google Books', srcGoogle, 3], ['BnF', srcBnf, 3], ['Open Library', srcOpenLibrary, 2]];
-    const results = await Promise.all(sources.map(async ([name, fn, tries]) => {
+    const results = sources.map(([name]) => ({ name, r: null, msg: 'trop lent' }));
+    let gotHit;
+    const hit = new Promise((res) => (gotHit = res));
+    const all = Promise.all(sources.map(async ([name, fn, tries], i) => {
       try {
         const r = await withRetry(() => fn(isbn), tries, (n) => onStatus && onStatus(name + ' ne répond pas, essai n°' + n + '…'));
-        return { name, r, msg: r ? 'trouvé' : 'inconnu' };
-      } catch (e) { return { name, r: null, msg: String((e && e.message) || e) }; }
+        results[i] = { name, r, msg: r ? 'trouvé' : 'inconnu' };
+        if (r) gotHit();
+      } catch (e) { results[i] = { name, r: null, msg: String((e && e.message) || e) }; }
     }));
+    // Dès qu'une source a trouvé, on laisse 2 secondes aux autres pour compléter, pas plus
+    await Promise.race([all, hit]);
+    await Promise.race([all, sleep(2000)]);
     lastLookupReport = results.map((x) => x.name + ' : ' + x.msg);
     const found = results.map((x) => x.r).filter(Boolean);
     if (!found.length) return null;
@@ -215,10 +222,18 @@
       series: (bnf && bnf.series) || pick('series'), volume: (bnf && bnf.volume) || pick('volume'),
     };
     if (bnf && bnf.series && bnf.volume && !/tome|t\.|vol/i.test(b.title)) b.title = bnf.title;
-    onStatus && onStatus('Recherche de la couverture…');
-    const better = await findCover(b.isbn, b.ark);
-    if (better) b.cover = better;
     return b;
+  }
+
+  // Couverture cherchée en arrière-plan : l'écran s'affiche tout de suite, l'image arrive ensuite
+  function coverLater(b) {
+    if (!b.isbn || b.coverPhoto) return;
+    findCover(b.isbn, b.ark).then((u) => {
+      if (!u) return;
+      b.cover = u; b.coverTriedAt = Date.now();
+      const pv = $('#previewCover'); if (pv) pv.innerHTML = coverHTML(b);
+      if (state.books.includes(b)) { save(); if (!scanner.active) render(); }
+    }).catch(() => {});
   }
 
   // ---------- Recherche de couverture (plusieurs sources) ----------
@@ -513,7 +528,7 @@
   function closeSheet() { $('#sheetBackdrop').hidden = true; $('#sheetBody').innerHTML = ''; }
 
   function bookForm(b, { isNew }) {
-    return `<h2>${isNew ? 'Ajouter ce livre ?' : 'Modifier le livre'}</h2>
+    return `<h2>${isNew ? 'Ajouter un livre' : 'Compléter le livre'}</h2>
       ${isNew && b.cover ? `<div class="detail-top" style="margin-bottom:12px"><div class="detail-cover">${coverHTML(b)}</div><div class="detail-meta"><div class="kv">ISBN <b>${esc(b.isbn)}</b></div><div class="kv">${esc(b.publisher || '')}</div><div class="kv">${b.publishedDate ? 'Paru : ' + fmtDate(b.publishedDate) : ''}</div></div></div>` : ''}
       <form class="form" id="bookForm" autocomplete="off">
         <label>Titre<input type="text" name="title" value="${esc(b.title)}" required></label>
@@ -547,44 +562,187 @@
       };
       if (!upd.title) return toast('Il faut au moins un titre');
       if (isNew) {
-        const nb = Object.assign({}, b, upd, { id: uid(), addedAt: Date.now() });
-        state.books.push(nb);
-        save(); closeSheet(); render();
-        afterAdd(nb);
+        addBook(Object.assign({}, b, upd));
       } else {
-        Object.assign(b, upd); save(); closeSheet(); render(); toast('Modifications enregistrées');
+        Object.assign(b, upd); delete b.incomplete; save(); closeSheet(); render(); toast('Livre complété');
       }
     });
   }
 
+  // Zone d'informations en lecture seule
+  function bookCard(b) {
+    const row = (k, v) => v ? `<div class="info-row"><span class="info-k">${k}</span><span class="info-v">${v}</span></div>` : '';
+    return `<div class="detail-top"><div class="detail-cover" id="previewCover">${coverHTML(b)}</div>
+      <div class="detail-meta"><h2>${esc(b.title || 'Titre inconnu')}</h2><div class="kv">${esc(b.authors || 'Auteur inconnu')}</div></div></div>
+      <div class="info-box">
+        ${row('Série', esc(b.series))}
+        ${row('Tome', b.volume ? 'n° ' + b.volume : '')}
+        ${row('Éditeur', esc(b.publisher))}
+        ${row('Parution', b.publishedDate ? fmtDate(b.publishedDate) : '')}
+        ${row('Pages', b.pages ? b.pages : '')}
+        ${row('ISBN', esc(b.isbn))}
+        ${row('Ajouté le', b.addedAt ? new Date(b.addedAt).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' }) : '')}
+      </div>
+      ${b.description ? `<div class="desc">${esc(b.description)}</div>` : ''}`;
+  }
+
+  function confirmAdd(b) {
+    openSheet(`${bookCard(b)}
+      <div class="sheet-actions">
+        <button class="btn primary block" id="doAdd">＋ Ajouter à ma bibliothèque</button>
+        <button class="btn block" data-act="scan-again">Ce n’est pas le bon livre, rescanner</button>
+        <button class="btn ghost block" data-act="close">Annuler</button>
+      </div>`);
+    $('#doAdd').onclick = () => addBook(b);
+  }
+
+  function addBook(b) {
+    Object.assign(b, { id: uid(), addedAt: Date.now() });
+    delete b.incomplete;
+    state.books.push(b);
+    save(); render();
+    const missing = missingBefore(b);
+    if (missing.length) askFillPrevious(b, missing);
+    else afterAdd(b);
+  }
+
   function afterAdd(b) {
     openSheet(`<h2>✅ Ajouté !</h2><p class="muted">« ${esc(b.title)} » est maintenant dans ta bibliothèque.</p>
-      ${!b.cover ? '<p class="muted small">Pas de couverture trouvée pour ce livre. Tu peux la prendre en photo.</p>' : ''}
+      ${!b.cover ? '<p class="muted small">La couverture est en cours de recherche. Si elle n’arrive pas, tu peux la prendre en photo.</p>' : ''}
       <div class="sheet-actions"><button class="btn primary block" data-act="scan-again">Scanner un autre livre</button>
       ${!b.cover ? '<button class="btn block" id="addCoverNow">📷 Ajouter la couverture</button>' : ''}
       <button class="btn ghost block" data-act="close">Terminé</button></div>`);
     const c = $('#addCoverNow'); if (c) c.onclick = () => coverMenu(b, () => afterAdd(b));
   }
 
+  // ---------- Ajouter les tomes précédents d'une série ----------
+  function missingBefore(b) {
+    if (!b.series || !b.volume || b.volume < 2) return [];
+    const k = norm(b.series);
+    const owned = new Set(state.books.filter((x) => norm(x.series) === k).map((x) => x.volume));
+    const miss = [];
+    for (let v = 1; v < b.volume; v++) if (!owned.has(v)) miss.push(v);
+    return miss;
+  }
+  function volRange(list) {
+    // [1,2,3,5,6] -> "1 à 3, 5 et 6"
+    const parts = []; let a = list[0], p = list[0];
+    for (const v of list.slice(1).concat([null])) {
+      if (v === p + 1) { p = v; continue; }
+      parts.push(a === p ? '' + a : (p === a + 1 ? a + ', ' + p : a + ' à ' + p)); a = p = v;
+    }
+    return parts.length > 1 ? parts.slice(0, -1).join(', ') + ' et ' + parts[parts.length - 1] : parts[0];
+  }
+  function askFillPrevious(b, missing) {
+    const all = missing.length === b.volume - 1;
+    openSheet(`<h2>✅ Tome ${b.volume} ajouté !</h2>
+      <p>Veux-tu aussi ajouter ${all ? 'tous les tomes précédents' : 'les tomes qui te manquent avant celui-ci'} de <b>${esc(b.series)}</b> ?</p>
+      <p class="muted small">${missing.length === 1 ? 'Tome' : 'Tomes'} ${volRange(missing)} (${missing.length} livre${missing.length > 1 ? 's' : ''}).</p>
+      <div class="sheet-actions">
+        <button class="btn primary block" id="fillYes">Oui, ajouter ${all ? 'les tomes 1 à ' + (b.volume - 1) : 'les ' + missing.length + ' tomes manquants'}</button>
+        <button class="btn block" id="fillNo">Non, juste le tome ${b.volume}</button>
+      </div>`);
+    $('#fillYes').onclick = () => fillPrevious(b, missing);
+    $('#fillNo').onclick = () => afterAdd(b);
+  }
+
+  // Cherche les infos d'un tome précis d'une série (BnF puis Google), sans ISBN
+  async function findVolume(series, v, ref, gIndex) {
+    const key = norm(series);
+    const sameEd = (pub) => !ref.publisher || !pub || norm(pub).split(' ')[0] === norm(ref.publisher).split(' ')[0];
+    try {
+      const recs = await withRetry(() => bnfSearch('bib.title all "' + series.replace(/"/g, '') + '" and bib.title all "' + v + '"', 15), 2);
+      const ok = recs.filter((r) => r.volume === v && norm(r.series) === key);
+      const best = ok.find((r) => sameEd(r.publisher) && r.isbn) || ok.find((r) => r.isbn) || ok[0];
+      if (best) return best;
+    } catch (e) { /* on essaie Google */ }
+    if (gIndex && gIndex.has(v)) return gIndex.get(v);
+    return null;
+  }
+  async function googleSeriesIndex(series) {
+    const map = new Map();
+    for (const start of [0, 40]) {
+      try {
+        const q = 'intitle:' + JSON.stringify(series);
+        const d = await withRetry(() => getJSON('https://www.googleapis.com/books/v1/volumes?q=' + encodeURIComponent(q) + '&maxResults=40&startIndex=' + start + '&printType=books&country=FR', 9000), 2);
+        for (const it of d.items || []) {
+          const b = fromGoogle(it);
+          if (b.volume && norm(b.series) === norm(series) && b.isbn && !map.has(b.volume)) map.set(b.volume, b);
+        }
+        if (!d.items || d.items.length < 40) break;
+      } catch (e) { break; }
+    }
+    return map;
+  }
+
+  async function fillPrevious(ref, missing) {
+    let done = 0, withInfo = 0, cancelled = false;
+    openSheet(`<h2>Ajout des tomes précédents…</h2><p class="muted small" id="fillStatus">Recherche des informations de chaque tome</p>
+      <div class="progress"><div class="progress-bar" id="fillBar"></div></div>
+      <div class="sheet-actions"><button class="btn ghost block" id="fillStop">Arrêter</button></div>`);
+    $('#fillStop').onclick = () => { cancelled = true; };
+    const gIndex = await googleSeriesIndex(ref.series);
+    const added = [];
+    const work = missing.slice();
+    const worker = async () => {
+      while (work.length && !cancelled) {
+        const v = work.shift();
+        const info = await findVolume(ref.series, v, ref, gIndex).catch(() => null);
+        if (cancelled) break;
+        // un livre ajouté entre-temps avec le même ISBN ? on évite les doublons
+        if (info && info.isbn && state.books.some((x) => x.isbn === info.isbn)) {
+          const ex = state.books.find((x) => x.isbn === info.isbn);
+          if (ex.volume === v && norm(ex.series) === norm(ref.series)) { done++; continue; }
+          info.isbn = ''; // fiche douteuse : on garde le tome mais sans cet ISBN
+        }
+        const nb = {
+          id: uid(), addedAt: Date.now() - (ref.volume - v), // garde l'ordre des tomes dans « Ajout récent »
+          isbn: (info && info.isbn) || '', ark: (info && info.ark) || '',
+          title: (info && info.title) || (ref.series + ' – Tome ' + v),
+          authors: (info && info.authors) || ref.authors || '', publisher: (info && info.publisher) || ref.publisher || '',
+          publishedDate: (info && info.publishedDate) || '', pages: (info && info.pages) || null,
+          description: (info && info.description) || '', cover: (info && info.cover) || '',
+          series: ref.series, volume: v,
+        };
+        if (info) withInfo++;
+        state.books.push(nb); added.push(nb);
+        done++;
+        const st = $('#fillStatus'); if (st) st.textContent = `Tome ${v} ajouté — ${done}/${missing.length}`;
+        const bar = $('#fillBar'); if (bar) bar.style.width = Math.round((done / missing.length) * 100) + '%';
+        save();
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]); // 3 tomes cherchés en même temps
+    save(); render();
+    // Couvertures : l'une après l'autre, en arrière-plan
+    (async () => { for (const nb of added) { if (!nb.cover && nb.isbn) { const u = await findCover(nb.isbn, nb.ark).catch(() => ''); nb.coverTriedAt = Date.now(); if (u) { nb.cover = u; save(); render(); } } } })();
+    openSheet(`<h2>✅ ${added.length} tome${added.length > 1 ? 's' : ''} ajouté${added.length > 1 ? 's' : ''}</h2>
+      <p class="muted">${esc(ref.series)} : tu as maintenant les tomes 1 à ${ref.volume}${cancelled ? ' (ajout arrêté en cours de route)' : ''}.</p>
+      ${withInfo < added.length ? `<p class="muted small">${added.length - withInfo} tome${added.length - withInfo > 1 ? 's' : ''} sans fiche détaillée trouvée : ils sont ajoutés avec le nom de la série et leur numéro.</p>` : ''}
+      <p class="muted small">Les couvertures arrivent petit à petit.</p>
+      <div class="sheet-actions"><button class="btn primary block" data-act="scan-again">Scanner un autre livre</button>
+      <button class="btn ghost block" data-act="close">Terminé</button></div>`);
+  }
+
   function openBook(id) {
     const b = state.books.find((x) => x.id === id);
     if (!b) return;
-    openSheet(`<div class="detail-top"><div class="detail-cover">${coverHTML(b)}</div>
-      <div class="detail-meta"><h2>${esc(b.title)}</h2>
-        <div class="kv">${esc(b.authors || 'Auteur inconnu')}</div>
-        ${b.series ? `<div class="kv">Série : <b>${esc(b.series)}</b>${b.volume ? ' · Tome <b>' + b.volume + '</b>' : ''}</div>` : ''}
-        ${b.publisher ? `<div class="kv">${esc(b.publisher)}</div>` : ''}
-        ${b.publishedDate ? `<div class="kv">Paru : ${fmtDate(b.publishedDate)}</div>` : ''}
-        ${b.pages ? `<div class="kv">${b.pages} pages</div>` : ''}
-        ${b.isbn ? `<div class="kv">ISBN ${esc(b.isbn)}</div>` : ''}
-      </div></div>
-      ${b.description ? `<div class="desc">${esc(b.description)}</div>` : ''}
+    openSheet(`${bookCard(b)}
       <div class="sheet-actions">
         <button class="btn block" data-act="cover" data-id="${b.id}">🖼️ ${b.cover ? 'Changer la couverture' : 'Ajouter une couverture'}</button>
-        <button class="btn block" data-act="edit" data-id="${b.id}">✏️ Modifier</button>
+        ${b.incomplete ? `<button class="btn block" id="relookup">🔎 Relancer la recherche</button>
+          <button class="btn block" data-act="edit" data-id="${b.id}">✏️ Compléter à la main</button>` : ''}
         <button class="btn danger block" data-act="delete" data-id="${b.id}">🗑️ Retirer de ma bibliothèque</button>
         <button class="btn ghost block" data-act="close">Fermer</button>
       </div>`);
+    const rl = $('#relookup');
+    if (rl) rl.onclick = async () => {
+      rl.textContent = 'Recherche…'; rl.disabled = true;
+      const f = b.isbn ? await lookupIsbn(b.isbn) : null;
+      if (f && f.title) {
+        Object.assign(b, f); delete b.incomplete; save(); render(); coverLater(b); openBook(b.id); toast('Livre trouvé 🎉');
+      } else { toast('Toujours introuvable'); rl.textContent = '🔎 Relancer la recherche'; rl.disabled = false; }
+    };
   }
 
   // ---------- Scan ----------
@@ -719,6 +877,7 @@
         if (b.series) { const ex = seriesList().find((s) => s.key === norm(b.series)); if (ex) b.series = ex.name; }
         state.books.push(Object.assign(b, { id: uid(), addedAt: Date.now() }));
         it.state = 'ok'; it.title = b.title; it.cover = b.cover;
+        coverLater(b);
       } else {
         state.books.push({ id: uid(), addedAt: Date.now(), isbn: it.isbn, title: 'À compléter (ISBN ' + it.isbn + ')', authors: '', series: '', volume: null, cover: '', incomplete: true });
         it.state = 'todo'; it.title = 'Introuvable — ajouté « à compléter »';
@@ -820,7 +979,8 @@
     const notFound = `<p class="muted small">Je n’ai pas trouvé ce livre automatiquement.</p>
       <button class="btn block" type="button" id="retryLookup" style="margin-bottom:10px">↻ Réessayer la recherche</button>
       <p class="muted small" style="font-size:11px;opacity:.8">${esc(lastLookupReport.join(' · '))}</p><p class="muted small">Ou remplis les infos toi-même :</p>`;
-    openSheet((found ? '' : notFound) + bookForm(b, { isNew: true }));
+    if (found) { confirmAdd(b); coverLater(b); return; }
+    openSheet(notFound + bookForm(b, { isNew: true }));
     wireBookForm(b, true);
     const rb = $('#retryLookup'); if (rb) rb.addEventListener('click', () => handleCode(n13));
   }
