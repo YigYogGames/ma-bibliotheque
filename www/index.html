@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#1f1712">
+  <title>Ma Bibliothèque</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body data-theme="bois">
+  <header class="topbar">
+    <h1 id="viewTitle">Ma bibliothèque</h1>
+    <div class="topbar-sub" id="viewSub"></div>
+  </header>
+
+  <main id="main">
+    <!-- BIBLIOTHÈQUE -->
+    <section class="view active" id="view-library">
+      <div class="toolbar">
+        <input type="search" id="searchInput" placeholder="Rechercher un titre, un auteur, une série…" autocomplete="off">
+        <div class="toolbar-row">
+          <select id="sortSelect" aria-label="Trier">
+            <option value="added">Ajout récent</option>
+            <option value="title">Titre (A→Z)</option>
+            <option value="author">Auteur (A→Z)</option>
+            <option value="series">Série puis tome</option>
+            <option value="date">Date de parution</option>
+          </select>
+          <div class="seg" role="group" aria-label="Affichage">
+            <button class="seg-btn active" data-layout="shelf" title="Étagères">▥</button>
+            <button class="seg-btn" data-layout="list" title="Liste">☰</button>
+          </div>
+        </div>
+      </div>
+      <div id="libraryContent"></div>
+    </section>
+
+    <!-- SÉRIES -->
+    <section class="view" id="view-series">
+      <div id="seriesContent"></div>
+    </section>
+
+    <!-- SORTIES -->
+    <section class="view" id="view-releases">
+      <div class="releases-head">
+        <button class="btn primary" id="checkReleasesBtn">↻ Chercher les nouveautés</button>
+        <button class="btn ghost" id="addReleaseBtn">+ Ajouter à la main</button>
+      </div>
+      <div class="muted small" id="lastCheck"></div>
+      <div id="releasesContent"></div>
+    </section>
+
+    <!-- RÉGLAGES -->
+    <section class="view" id="view-settings">
+      <div class="card">
+        <h3>Décor</h3>
+        <p class="muted small">Choisis l'ambiance de ta bibliothèque.</p>
+        <div class="themes" id="themePicker">
+          <button class="theme-chip" data-theme-pick="bois"><span class="sw sw-bois"></span>Bois</button>
+          <button class="theme-chip" data-theme-pick="nuit"><span class="sw sw-nuit"></span>Nuit</button>
+          <button class="theme-chip" data-theme-pick="papier"><span class="sw sw-papier"></span>Papier</button>
+          <button class="theme-chip" data-theme-pick="pastel"><span class="sw sw-pastel"></span>Pastel</button>
+          <button class="theme-chip" data-theme-pick="manga"><span class="sw sw-manga"></span>Manga</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Ajouter sans code-barres</h3>
+        <p class="muted small">Pour un livre sans code-barres, ou si le scan ne marche pas.</p>
+        <div class="row-btns">
+          <button class="btn" id="manualIsbnBtn">Saisir un ISBN</button>
+          <button class="btn" id="manualBookBtn">Saisir un livre à la main</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Sauvegarde</h3>
+        <p class="muted small">Tes livres sont enregistrés sur ton téléphone. Fais une copie de temps en temps : tu pourras la recharger si tu changes de téléphone.</p>
+        <div class="row-btns">
+          <button class="btn" id="exportBtn">Exporter ma bibliothèque</button>
+          <button class="btn" id="importBtn">Importer une sauvegarde</button>
+          <input type="file" id="importFile" accept=".json,application/json" hidden>
+        </div>
+      </div>
+      <div class="card">
+        <h3>À propos</h3>
+        <p class="muted small" id="aboutText">Ma Bibliothèque — version 0.1. Infos des livres : Google Books et Open Library.</p>
+      </div>
+    </section>
+  </main>
+
+  <button class="fab" id="scanBtn" aria-label="Scanner un livre">
+    <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true"><path fill="currentColor" d="M3 5h2v14H3zm3 0h1v14H6zm2 0h2v14H8zm3 0h1v14h-1zm3 0h2v14h-2zm3 0h1v14h-1zm2 0h2v14h-2z"/></svg>
+  </button>
+
+  <nav class="tabbar">
+    <button class="tab active" data-view="library"><span class="ti">📚</span>Livres</button>
+    <button class="tab" data-view="series"><span class="ti">🗂️</span>Séries</button>
+    <span class="tab-spacer"></span>
+    <button class="tab" data-view="releases"><span class="ti">📅</span>Sorties<span class="badge" id="releaseBadge" hidden></span></button>
+    <button class="tab" data-view="settings"><span class="ti">⚙️</span>Réglages</button>
+  </nav>
+
+  <!-- Feuille modale générique -->
+  <div class="sheet-backdrop" id="sheetBackdrop" hidden>
+    <div class="sheet" id="sheet" role="dialog" aria-modal="true">
+      <div class="sheet-grip"></div>
+      <div id="sheetBody"></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

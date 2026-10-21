@@ -1,0 +1,61 @@
+name: Construire l'APK Android
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Installer les dépendances
+        run: npm install --no-audit --no-fund
+
+      - name: Créer le projet Android
+        run: |
+          npx cap add android
+          BUILD_NUMBER=${{ github.run_number }} node scripts/patch-android.js
+          npx cap sync android
+
+      - name: Clé de signature fixe (pour installer les mises à jour par-dessus)
+        run: |
+          mkdir -p ~/.android
+          cp signing/debug.keystore ~/.android/debug.keystore
+
+      - name: Compiler l'APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk ../MaBibliotheque.apk
+
+      - name: Garder l'APK (onglet Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaBibliotheque-apk
+          path: MaBibliotheque.apk
+
+      - name: Publier l'APK (téléchargeable depuis le téléphone)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.${{ github.run_number }}
+          name: Ma Bibliothèque 0.1.${{ github.run_number }}
+          body: |
+            Télécharge **MaBibliotheque.apk** ci-dessous depuis ton téléphone, puis ouvre-le pour l'installer.
+          files: MaBibliotheque.apk
+          make_latest: true
