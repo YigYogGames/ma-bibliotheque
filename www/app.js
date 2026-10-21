@@ -36,6 +36,7 @@
   const norm = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
     .replace(/[^a-z0-9]+/g, ' ').trim();
   const isNative = () => !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+  const MONTHS_LONG = ['Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin', 'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'];
   const MONTHS = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
 
   function toast(msg, ms = 2400) {
@@ -472,6 +473,31 @@
     }).catch(() => {});
   };
 
+  // ---------- Étagères (thèmes) ----------
+  const THEMES = [
+    { id: 'bois', name: 'Bois', deco: [], hang: [], top: '', books: ['#8a5a33', '#c0392b', '#2f6d5a'] },
+    { id: 'nuit', name: 'Nuit', deco: ['🌙'], hang: ['⭐'], top: '', books: ['#3a4664', '#7aa2ff', '#9b59b6'] },
+    { id: 'papier', name: 'Papier', deco: [], hang: [], top: '', books: ['#b4462b', '#d9c6a5', '#2b2520'] },
+    { id: 'pastel', name: 'Pastel', deco: ['🌷'], hang: [], top: '', books: ['#f2c6d8', '#a978d6', '#9ad1c3'] },
+    { id: 'manga', name: 'Manga', deco: ['💥'], hang: [], top: '', books: ['#e8202a', '#111', '#888'] },
+    { id: 'dark-fantasy', name: 'Dark Fantasy', deco: ['🕯️', '💀', '🔮', '🗝️', '📜'], hang: ['⛓️', '🦇'], top: '🌙 ✦ 🕯️ ✦ 🌙', books: ['#4b2a6b', '#1f3b2e', '#6b1f2a'] },
+    { id: 'medieval', name: 'Médiéval Fantasy', deco: ['🛡️', '🗡️', '🍺', '👑', '🕯️', '📜'], hang: ['🏴', '🔥'], top: '⚜️ ⚔️ 🏰 ⚔️ ⚜️', books: ['#7a2a1f', '#2c4a2a', '#c9a227'] },
+    { id: 'japon', name: 'Japon', deco: ['🎎', '🍵', '🌸', '🎏', '🗻'], hang: ['🏮'], top: '🌸 ⛩️ 🌸', books: ['#c0392b', '#2a1d16', '#e8b4b8'] },
+    { id: 'halloween', name: 'Halloween', deco: ['🎃', '🕯️', '🧙', '🍬', '💀', '🧪'], hang: ['🦇', '🕷️', '🕸️'], top: '🕸️ 🎃 🦇 🎃 🕸️', books: ['#ff7a1a', '#3b1f5e', '#1a1a1a'] },
+    { id: 'cosy', name: 'Cosy', deco: ['🪴', '☕', '🕯️', '🧸', '🧶', '🍪'], hang: [], lights: true, top: '✨ 🪴 ✨', books: ['#c8743f', '#7a9a6a', '#e8c39e'] },
+  ];
+  const themeOf = (id) => THEMES.find((t) => t.id === id) || THEMES[0];
+  function themeCardsHTML() {
+    return '<div class="theme-grid">' + THEMES.map((t) => `<button class="theme-card ${t.id === state.settings.theme ? 'active' : ''}" data-theme="${t.id}" data-pick-theme="${t.id}">
+      <span class="tc-wall">${t.books.map((c, i) => `<span class="tc-book" style="background:${c};height:${[52, 60, 46][i]}px"></span>`).join('')}<span class="tc-deco">${t.deco[0] || ''}</span></span>
+      <span class="tc-plank"></span><span class="tc-name">${esc(t.name)}</span></button>`).join('') + '</div>';
+  }
+  function pickTheme(id) { state.settings.theme = id; save(); applyTheme(); render(); }
+  function openShelfPicker() {
+    openSheet(`<h2>Choisir une étagère</h2>${themeCardsHTML()}<div class="sheet-actions"><button class="btn ghost block" data-act="close">Fermer</button></div>`);
+    $$('[data-pick-theme]', $('#sheetBody')).forEach((c) => c.onclick = () => { pickTheme(c.dataset.pickTheme); openShelfPicker(); });
+  }
+
   // ---------- Navigation ----------
   const TITLES = { library: 'Ma bibliothèque', series: 'Mes séries', releases: 'Sorties prévues', settings: 'Réglages' };
   let currentView = 'library';
@@ -558,11 +584,19 @@
         </div>`).join('') + '</div>';
     } else {
       const cols = Math.max(3, Math.floor((Math.min(window.innerWidth, 900) - 40) / 112));
-      let html = '<div class="shelf">';
+      const T = themeOf(state.settings.theme);
+      let html = '<div class="shelf">' + (T.top ? `<div class="shelf-top">${T.top}</div>` : '');
+      let row = 0;
       for (let i = 0; i < list.length; i += cols) {
-        html += `<div class="shelf-row" style="--cols:${cols}">` + list.slice(i, i + cols).map((b) =>
-          `<div class="book" data-id="${b.id}">${coverHTML(b)}${b.volume ? `<span class="vol-tag">${b.volume}</span>` : ''}</div>`).join('') +
-          '</div><div class="shelf-plank"></div>';
+        const books = list.slice(i, i + cols);
+        // objets décoratifs dans les places libres de l'étagère
+        let deco = '';
+        for (let k = books.length; k < cols && T.deco.length; k++) deco += `<div class="deco-item ${k % 2 ? 'small' : ''}">${T.deco[(row * 2 + k) % T.deco.length]}</div>`;
+        const hang = T.hang.length ? `<span class="hang ${row % 2 ? 'r' : 'l'}">${T.hang[row % T.hang.length]}</span>` : '';
+        html += `<div class="shelf-row" style="--cols:${cols}">` + books.map((b) =>
+          `<div class="book" data-id="${b.id}">${coverHTML(b)}${b.volume ? `<span class="vol-tag">${b.volume}</span>` : ''}</div>`).join('') + deco +
+          `</div><div class="shelf-plank">${hang}${T.lights ? '<span class="lights"></span>' : ''}</div>`;
+        row++;
       }
       el.innerHTML = html + '</div>';
     }
@@ -626,38 +660,44 @@
     const el = $('#releasesContent');
     const rp = state.lastReport;
     const srcTxt = (name, x) => !x ? '' : (x.ok ? name + ' OK' : (x.err ? name + ' indisponible' + (x.last ? ' (' + x.last + ')' : '') : ''));
-    const rpTxt = rp ? ' · ' + [srcTxt('BnF', rp.bnf), srcTxt('Google Books', rp.google)].filter(Boolean).join(' · ') : '';
+    const rpTxt = rp ? ' · Sources : ' + [srcTxt('Place des Libraires', rp.pdl), srcTxt('Decitre', rp.decitre), srcTxt('Google Books', rp.google), srcTxt('BnF', rp.bnf)].filter(Boolean).join(' · ') : '';
     const auto = state.releasesFromServer ? ' · mise à jour automatique chaque nuit' : '';
     $('#lastCheck').textContent = state.lastCheck ? 'Dernière recherche : ' + new Date(state.lastCheck).toLocaleString('fr-FR', { dateStyle: 'medium', timeStyle: 'short' }) + auto + rpTxt : '';
     if (!seriesList().length) {
       el.innerHTML = `<div class="empty"><div class="big">📅</div><h2>Pas encore de série</h2><p>Ajoute des livres qui font partie d'une série, puis reviens ici : je chercherai les prochains tomes et leurs dates de sortie.</p></div>`;
       return;
     }
-    const all = visibleReleases();
-    const today = todayKey();
-    const upcoming = all.filter((r) => isUpcoming(r)).sort((a, b) => dateKey(a.date).localeCompare(dateKey(b.date)));
-    const past = all.filter((r) => r.date && !isUpcoming(r)).sort((a, b) => dateKey(b.date).localeCompare(dateKey(a.date)));
-    const nodate = all.filter((r) => !r.date);
-    if (!all.length) {
-      el.innerHTML = `<div class="empty"><p>${state.lastCheck ? 'Aucune nouvelle sortie trouvée pour tes séries. Tu peux en ajouter une à la main si tu connais la date.' : 'Appuie sur « Chercher les nouveautés » pour trouver les prochains tomes de tes séries.'}</p></div>`;
+    // Seulement les tomes à venir, du plus proche au plus lointain (sans limite de durée)
+    const upcoming = visibleReleases().filter((r) => isUpcoming(r)).sort((a, b) => dateKey(a.date).localeCompare(dateKey(b.date)));
+    if (!upcoming.length) {
+      el.innerHTML = `<div class="empty"><p>${state.lastCheck ? 'Aucune sortie annoncée pour l’instant pour tes séries. Je revérifie chaque nuit. Tu peux aussi en ajouter une à la main si tu connais la date.' : 'Appuie sur « Chercher les nouveautés » pour trouver les prochains tomes de tes séries.'}</p></div>`;
       return;
     }
-    const row = (r, isPast) => {
+    const now = new Date(todayKey());
+    const inDays = (d) => Math.round((new Date(dateKey(d)) - now) / 864e5);
+    const when = (d) => { const n = inDays(d); return n <= 0 ? 'aujourd’hui' : n === 1 ? 'demain' : n < 60 ? 'dans ' + n + ' jours' : 'dans ' + Math.round(n / 30) + ' mois'; };
+    const row = (r) => {
       const p = String(r.date || '').split('-');
-      const d = p[2] ? +p[2] : (p[1] ? '' : '');
+      const d = p[2] ? +p[2] : '';
       const m = p[1] ? MONTHS[+p[1] - 1] : '';
+      const src = r.manual ? 'ajouté à la main' : (r.sources && r.sources.length ? r.sources.join(', ') : '');
       return `<div class="rel" data-rel="${r.id}">
-        <div class="rel-date ${isPast ? 'past' : ''}"><div class="d">${d || (p[0] ? '' : '?')}</div><div class="m">${m}${p[0] ? '<br>' + p[0] : ''}</div></div>
+        <div class="rel-date"><div class="d">${d}</div><div class="m">${m}${p[0] ? '<br>' + p[0] : ''}</div></div>
         ${r.cover ? `<div class="thumb"><img src="${esc(r.cover)}" alt="" loading="lazy" onerror="this.parentNode.remove()"></div>` : ''}
         <div class="li-main"><div class="li-title">${esc(r.series)}${r.volume ? ' — Tome ' + r.volume : ''}</div>
-          <div class="li-sub">${esc(r.title || '')}${r.manual ? (r.title ? ' · ' : '') + 'ajouté à la main' : ''}</div></div>
+          <div class="li-sub">${when(r.date)}${src ? ' · ' + esc(src) : ''}</div></div>
         <button class="rel-x" data-dismiss="${r.id}" aria-label="Masquer">✕</button>
       </div>`;
     };
-    el.innerHTML =
-      (upcoming.length ? `<div class="rel-group-title">À venir</div>` + upcoming.map((r) => row(r, false)).join('') : '') +
-      (past.length ? `<div class="rel-group-title">Déjà parus — pas encore dans ta bibliothèque</div>` + past.map((r) => row(r, true)).join('') : '') +
-      (nodate.length ? `<div class="rel-group-title">Date inconnue</div>` + nodate.map((r) => row(r, true)).join('') : '');
+    // regroupement par mois
+    let html = '', cur = '';
+    for (const r of upcoming) {
+      const p = dateKey(r.date).split('-');
+      const label = MONTHS_LONG[+p[1] - 1] + ' ' + p[0];
+      if (label !== cur) { html += `<div class="rel-group-title">${label}</div>`; cur = label; }
+      html += row(r);
+    }
+    el.innerHTML = html;
   }
 
   function renderBadge() {
@@ -669,7 +709,8 @@
 
   function renderSettings() {
     renderSyncStatus();
-    $$('.theme-chip').forEach((c) => c.classList.toggle('active', c.dataset.themePick === state.settings.theme));
+    const tp = $('#themePicker');
+    if (tp) { tp.innerHTML = themeCardsHTML(); $$('[data-pick-theme]', tp).forEach((c) => c.onclick = () => { pickTheme(c.dataset.pickTheme); renderSettings(); }); }
   }
 
   function applyTheme() {
@@ -1348,7 +1389,8 @@
       await loadServerReleases(true);
       btn.disabled = false; btn.textContent = '↻ Chercher les nouveautés';
       const n = visibleReleases().length;
-      toast(n ? `${n} tome${n > 1 ? 's' : ''} trouvé${n > 1 ? 's' : ''} pour tes séries 🎉` : 'Rien de nouveau pour l’instant');
+      const up = visibleReleases().filter((r) => isUpcoming(r)).length;
+      toast(up ? `${up} sortie${up > 1 ? 's' : ''} à venir 🎉` : 'Aucune sortie annoncée pour l’instant');
       return;
     } catch (e) { /* serveur indisponible : recherche directe depuis le téléphone */ }
     return checkReleasesLocal();
@@ -1453,7 +1495,7 @@
     $('#searchInput').addEventListener('input', renderLibrary);
     $('#sortSelect').addEventListener('change', (e) => { state.settings.sort = e.target.value; save(); renderLibrary(); });
     $$('.seg-btn').forEach((b) => b.addEventListener('click', () => { state.settings.layout = b.dataset.layout; save(); renderLibrary(); }));
-    $$('.theme-chip').forEach((c) => c.addEventListener('click', () => { state.settings.theme = c.dataset.themePick; save(); applyTheme(); renderSettings(); }));
+    $('#shelfBtn').addEventListener('click', openShelfPicker);
     $('#checkReleasesBtn').addEventListener('click', checkReleases);
     $('#addReleaseBtn').addEventListener('click', addReleaseManually);
     $('#manualIsbnBtn').addEventListener('click', () => askIsbn());

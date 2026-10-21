@@ -361,6 +361,64 @@ async function volumes(series: string, vols: number[], publisher: string, refIsb
   return out;
 }
 
+// ---------- Libraires (dates à venir) ----------
+const UA = { "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36", "Accept-Language": "fr-FR,fr;q=0.9" };
+async function getPage(url: string, timeout = 15000) {
+  const r = await fetch(url, { signal: AbortSignal.timeout(timeout), headers: UA });
+  if (!r.ok) throw new Error("erreur " + r.status);
+  return await r.text();
+}
+const MOIS: Record<string, string> = { janvier: "01", fevrier: "02", mars: "03", avril: "04", mai: "05", juin: "06", juillet: "07", aout: "08", septembre: "09", octobre: "10", novembre: "11", decembre: "12" };
+function frDate(s: string) {
+  const m = norm(s).match(/(\d{1,2}) ([a-z]+) (\d{4})/);
+  if (m && MOIS[m[2]]) return m[3] + "-" + MOIS[m[2]] + "-" + m[1].padStart(2, "0");
+  const m2 = String(s).match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  return m2 ? m2[3] + "-" + m2[2] + "-" + m2[1] : "";
+}
+const strip = (h: string) => xmlDecode(String(h).replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ")).trim();
+const frenchIsbn = (i: string) => /^(9782|97910)/.test(i || "");
+
+// Place des Libraires : la recherche affiche titre, éditeur, date de parution et ISBN
+async function placeDesLibraires(query: string) {
+  const html = await getPage("https://www.placedeslibraires.fr/listeliv.php?base=allbooks&mots_recherche=" + encodeURIComponent(query), 25000);
+  const out: any[] = [];
+  for (const block of html.split('<h2 class="livre_titre">').slice(1)) {
+    const isbn = (block.match(/\/livre\/(\d{13})-/) || [])[1] || "";
+    const title = strip((block.match(/<a [^>]*>([\s\S]*?)<\/a>/) || [])[1] || "");
+    const publisher = strip((block.match(/itemprop="publisher">([\s\S]*?)</) || [])[1] || "");
+    const date = frDate(strip((block.match(/class="MiseEnLigne">([\s\S]*?)</) || [])[1] || ""));
+    if (!isbn || !title) continue;
+    const ps = parseSeries(title);
+    out.push({ isbn, title, publisher, date, series: ps.series, volume: ps.volume, src: "Place des Libraires",
+      cover: "https://images.epagine.fr/" + isbn.slice(-3) + "/" + isbn + "_1_m.jpg" });
+  }
+  return out;
+}
+// Decitre : la recherche signale les livres « à paraître », la page du livre donne la date
+async function decitre(query: string) {
+  const html = await getPage("https://www.decitre.fr/rechercher/result?q=" + encodeURIComponent(query), 20000);
+  const out: any[] = [];
+  const seen = new Set();
+  const re = /"title":"([^"]+)"[^{}]{0,400}?|"path":"(\/livres\/[^"]+-(\d{13})\.html)"[\s\S]{0,600}?"tags":\[([^\]]*)\],"title":"([^"]+)"/g;
+  let m;
+  while ((m = re.exec(html))) {
+    if (!m[2] || seen.has(m[3])) continue;
+    seen.add(m[3]);
+    if (!/is_upcoming/.test(m[4])) continue; // seulement les livres à paraître
+    const title = xmlDecode(m[5].replace(/\\u0027/g, "'"));
+    const ps = parseSeries(title);
+    out.push({ isbn: m[3], title, path: m[2], series: ps.series, volume: ps.volume, src: "Decitre", date: "", publisher: "" });
+  }
+  for (const r of out.slice(0, 4)) {
+    try {
+      const page = await getPage("https://www.decitre.fr" + r.path, 20000);
+      r.date = (page.match(/"datePublished":"(\d{4}-\d{2}-\d{2})"/) || [])[1] || "";
+      r.cover = "https://products-images.di-static.com/image/x/" + r.isbn + "-475x500-1.jpg";
+    } catch { /* sans date */ }
+  }
+  return out.filter((r) => r.date);
+}
+
 // ---------- Sorties prévues ----------
 const dateKey = (d: string) => {
   if (!d) return "9999-99-99";
@@ -369,65 +427,74 @@ const dateKey = (d: string) => {
 };
 async function releasesForSeries(name: string, books: any[], report: any) {
   const key = norm(name);
+  const today = new Date().toISOString().slice(0, 10);
   const vols = books.map((b) => b.volume).filter(Boolean);
   const maxOwned = vols.length ? Math.max(...vols) : 0;
   const ownedIsbn = new Set(books.map((b) => b.isbn));
+  const last = books.filter((b) => b.volume === maxOwned).find((b) => b.isbn) || books.find((b) => b.volume === maxOwned) || books[0];
+  const myPub = pubWord(last?.publisher || "");
   const byVol = new Map<number, any>();
-  const prec = (d: string) => String(d || "").split("-").length;
-  const keep = (r: any, s: string) => {
-    if (!s || norm(s) !== key || !r.volume) return;
-    if (vols.includes(r.volume) || ownedIsbn.has(r.isbn) || r.volume < maxOwned) return;
+  // une sortie retenue : la bonne série, un tome qu'on n'a pas, une date dans le futur
+  const keep = (r: any) => {
+    if (!r || !r.series || norm(r.series) !== key || !r.volume || !r.date) return;
+    if (vols.includes(r.volume) || ownedIsbn.has(r.isbn) || r.volume <= maxOwned) return;
+    if (dateKey(r.date) < today) return;
+    if (r.isbn && !frenchIsbn(r.isbn)) return; // édition étrangère (ex. version japonaise)
+    if (myPub && r.publisher && pubWord(r.publisher) !== myPub) return; // autre éditeur = autre édition
     const prev = byVol.get(r.volume);
-    if (!prev || prec(r.date) > prec(prev.date) || (prec(r.date) === prec(prev.date) && dateKey(r.date) > dateKey(prev.date))) {
-      byVol.set(r.volume, { ...(prev || {}), ...r, cover: r.cover || prev?.cover || "" });
-    }
+    const prec = (d: string) => String(d || "").split("-").length;
+    const special = (t: string) => /collector|coffret|edition speciale|edition limitee|limited|integrale|pack /.test(norm(t));
+    const better = !prev || (special(prev.title) && !special(r.title)) || (special(prev.title) === special(r.title) && prec(r.date) > prec(prev.date));
+    if (better) byVol.set(r.volume, { ...(prev || {}), ...r, cover: r.cover || prev?.cover || "", sources: [...new Set([...(prev?.sources || []), r.src])] });
+    else if (!special(r.title)) prev.sources = [...new Set([...(prev.sources || []), r.src])];
   };
-  try {
-    const data = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent("intitle:" + JSON.stringify(name)) + "&orderBy=newest&maxResults=40&printType=books&langRestrict=fr")), 3);
-    for (const it of data.items || []) {
-      const b = fromGoogle(it);
-      keep({ series: name, volume: b.volume, title: b.title, date: b.publishedDate, isbn: b.isbn, cover: b.cover }, b.series);
-    }
-    report.google.ok++;
-  } catch (e) { report.google.err++; report.google.last = String((e as Error)?.message || e); }
+  // 1) Dernier tome déjà paru (BnF) : les prochains numéros sont juste après
+  let latest = maxOwned;
   if (maxOwned) {
-    const last = books.filter((b) => b.volume === maxOwned).find((b) => b.isbn) || books.find((b) => b.volume === maxOwned);
     let ref: any = null;
     if (last?.isbn) { try { ref = await srcBnf(last.isbn); } catch { /* sans référence */ } }
     if (!ref) ref = { publisher: last?.publisher || "" };
-    // On avance tome par tome tant que la BnF en trouve (2 trous d'affilée = fin), 30 tomes maximum
     let misses = 0;
-    for (let v = maxOwned + 1; v <= maxOwned + 30 && misses < 2; v++) {
+    for (let v = maxOwned + 1; v <= maxOwned + 40 && misses < 2; v++) {
       try {
         const recs = await withRetry(() => bnfVolumeSearch(name, v, ref.publisher), 2);
-        const r = pickVolume(recs, v, key, ref);
-        if (r) { keep({ series: name, volume: r.volume, title: r.title, date: r.publishedDate, isbn: r.isbn, cover: r.cover || "", out: true }, r.series); misses = 0; }
-        else misses++;
+        if (pickVolume(recs, v, key, ref)) { latest = v; misses = 0; } else misses++;
         report.bnf.ok++;
       } catch (e) { report.bnf.err++; report.bnf.last = String((e as Error)?.message || e); misses++; }
     }
   }
-  // Google, recherche ciblée des prochains numéros (c'est là que se trouvent les dates à venir)
-  const known = Math.max(maxOwned, ...[...byVol.keys()]);
-  if (known) {
-    for (const v of [known + 1, known + 2, known + 3]) {
-      try {
-        const q = "intitle:" + JSON.stringify(name) + " " + v;
-        const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent(q) + "&maxResults=20&printType=books&langRestrict=fr")), 2);
-        for (const it of d.items || []) {
-          const b = fromGoogle(it);
-          if (b.volume === v) keep({ series: name, volume: b.volume, title: b.title, date: b.publishedDate, isbn: b.isbn, cover: b.cover }, b.series);
-        }
-        report.google.ok++;
-      } catch (e) { report.google.err++; report.google.last = String((e as Error)?.message || e); }
-    }
+  // 2) Les 3 numéros suivants, demandés à plusieurs sites en même temps
+  const next = latest ? [latest + 1, latest + 2, latest + 3] : [];
+  const tasks: Promise<void>[] = [];
+  const run = (srcName: string, fn: () => Promise<any[]>) => tasks.push((async () => {
+    const rk = srcName === "Google Books" ? "google" : srcName === "Decitre" ? "decitre" : "pdl";
+    report[rk] = report[rk] || { ok: 0, err: 0, last: "" };
+    try { for (const r of await fn()) keep(r); report[rk].ok++; }
+    catch (e) { report[rk].err++; report[rk].last = String((e as Error)?.message || e); }
+  })());
+  // Place des Libraires : les numéros l'un après l'autre (le site n'aime pas les demandes simultanées)
+  run("Place des Libraires", async () => {
+    const all: any[] = [];
+    for (const v of next) { all.push(...await withRetry(() => placeDesLibraires(name + " " + v), 3)); await sleep(400); }
+    return all;
+  });
+  for (const v of next) {
+    run("Google Books", async () => {
+      const q = "intitle:" + JSON.stringify(name) + " " + v;
+      const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent(q) + "&maxResults=20&printType=books&langRestrict=fr")), 2);
+      return (d.items || []).map((it: any) => { const b = fromGoogle(it); return { ...b, date: b.publishedDate, src: "Google Books" }; });
+    });
   }
+  // Decitre : une recherche sur le nom de la série suffit (elle liste les livres à paraître)
+  run("Decitre", () => decitre(name));
+  // Google : les nouveautés les plus récentes de la série
+  run("Google Books", async () => {
+    const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent("intitle:" + JSON.stringify(name)) + "&orderBy=newest&maxResults=40&printType=books&langRestrict=fr")), 2);
+    return (d.items || []).map((it: any) => { const b = fromGoogle(it); return { ...b, date: b.publishedDate, src: "Google Books" }; });
+  });
+  await Promise.all(tasks);
   const list = [...byVol.values()];
-  for (const r of list) {
-    r.out = !!(r.out && (!r.date || r.date.length === 4));
-    r.id = "srv-" + key.replace(/ /g, "-") + "-" + r.volume;
-  }
-  // couvertures des sorties (en parallèle, limitées)
+  for (const r of list) { r.out = false; r.id = "srv-" + key.replace(/ /g, "-") + "-" + r.volume; }
   await Promise.all(list.filter((r) => r.cover).map(async (r) => { if (!(await okImage(r.cover))) r.cover = ""; }));
   await Promise.all(list.filter((r) => !r.cover && r.isbn).slice(0, 6).map(async (r) => { r.cover = await findCover(r.isbn); }));
   return list;
@@ -442,14 +509,14 @@ async function computeReleases(libraryId: string) {
     if (!groups.has(k)) groups.set(k, { name: b.series, books: [] });
     groups.get(k)!.books.push(b);
   }
-  const report = { google: { ok: 0, err: 0, last: "" }, bnf: { ok: 0, err: 0, last: "" } };
+  const report = { google: { ok: 0, err: 0, last: "" }, bnf: { ok: 0, err: 0, last: "" }, pdl: { ok: 0, err: 0, last: "" }, decitre: { ok: 0, err: 0, last: "" } };
   const series = [...groups.values()];
   const releases: any[] = [];
   const work = series.slice();
   const worker = async () => {
     while (work.length) { const s = work.shift()!; releases.push(...await releasesForSeries(s.name, s.books, report)); }
   };
-  await Promise.all([worker(), worker(), worker()]); // 3 séries à la fois
+  await Promise.all([worker(), worker()]); // 2 séries à la fois
   const row = { library_id: libraryId, releases, report, checked_at: new Date().toISOString() };
   await db.from("library_releases").upsert(row);
   return row;
@@ -526,6 +593,7 @@ Deno.serve(async (req) => {
     if (action === "cron") {
       const { data: cfg } = await db.from("app_config").select("value").eq("key", "cron_key").maybeSingle();
       if (!cfg || req.headers.get("x-cron-key") !== cfg.value) return json({ error: "interdit" }, 403);
+      if (body.id) { await computeReleases(body.id); return json({ updated: 1 }); }
       const since = new Date(Date.now() - 90 * 864e5).toISOString();
       const { data: libs } = await db.from("libraries").select("id").gte("last_seen", since);
       let n = 0;

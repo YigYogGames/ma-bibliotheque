@@ -30,6 +30,7 @@
             <button class="seg-btn active" data-layout="shelf" title="Étagères">▥</button>
             <button class="seg-btn" data-layout="list" title="Liste">☰</button>
           </div>
+          <button class="shelf-btn" id="shelfBtn" title="Changer d'étagère" aria-label="Changer d'étagère">🎨</button>
         </div>
       </div>
       <div id="libraryContent"></div>
@@ -53,15 +54,9 @@
     <!-- RÉGLAGES -->
     <section class="view" id="view-settings">
       <div class="card">
-        <h3>Décor</h3>
-        <p class="muted small">Choisis l'ambiance de ta bibliothèque.</p>
-        <div class="themes" id="themePicker">
-          <button class="theme-chip" data-theme-pick="bois"><span class="sw sw-bois"></span>Bois</button>
-          <button class="theme-chip" data-theme-pick="nuit"><span class="sw sw-nuit"></span>Nuit</button>
-          <button class="theme-chip" data-theme-pick="papier"><span class="sw sw-papier"></span>Papier</button>
-          <button class="theme-chip" data-theme-pick="pastel"><span class="sw sw-pastel"></span>Pastel</button>
-          <button class="theme-chip" data-theme-pick="manga"><span class="sw sw-manga"></span>Manga</button>
-        </div>
+        <h3>Étagère et décor</h3>
+        <p class="muted small">Choisis l'ambiance de ta bibliothèque. Tu peux aussi changer d'étagère avec le bouton 🎨 de l'écran Livres.</p>
+        <div class="themes" id="themePicker"></div>
       </div>
       <div class="card">
         <h3>Ajouter sans code-barres</h3>
@@ -92,7 +87,7 @@
       </div>
       <div class="card">
         <h3>À propos</h3>
-        <p class="muted small" id="aboutText">Ma Bibliothèque — version 0.6 (en ligne). Infos des livres : catalogue de la BnF, Google Books et Open Library.</p>
+        <p class="muted small" id="aboutText">Ma Bibliothèque — version 0.7. Infos des livres : catalogue de la BnF, Google Books et Open Library.</p>
       </div>
     </section>
   </main>
