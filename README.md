@@ -24,4 +24,4 @@ Chaque modification du code fabrique automatiquement un nouvel APK (onglet **Act
 - `scripts/patch-android.js` : icône, numéro de version
 - `signing/debug.keystore` : clé de signature de test (permet d'installer les mises à jour par-dessus)
 
-Infos des livres : Google Books et Open Library.
+Infos des livres : Google Books, catalogue de la BnF et Open Library.

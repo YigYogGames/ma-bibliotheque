@@ -74,12 +74,29 @@
     for (let k = 0; k < 12; k++) sum += (+core[k]) * (k % 2 ? 3 : 1);
     return core + ((10 - (sum % 10)) % 10);
   }
-  async function getJSON(url) {
-    const r = await fetch(url, { headers: { Accept: 'application/json' } });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
+  // Requête HTTP : on passe par le module natif quand on est dans l'application (pas de souci de CORS)
+  async function httpGet(url, timeoutMs = 10000) {
+    const H = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.CapacitorHttp;
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('délai dépassé')), timeoutMs));
+    if (isNative() && H && H.get) {
+      const r = await Promise.race([H.get({ url, headers: { Accept: 'application/json, text/xml, */*', 'User-Agent': 'MaBibliotheque/0.2 (Android)' }, responseType: 'text', connectTimeout: timeoutMs, readTimeout: timeoutMs }), timeout]);
+      if (r.status < 200 || r.status >= 300) throw new Error('erreur ' + r.status);
+      return typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+    }
+    const r = await Promise.race([fetch(url), timeout]);
+    if (!r.ok) throw new Error('erreur ' + r.status);
+    return r.text();
   }
+  async function getJSON(url, t) { return JSON.parse(await httpGet(url, t)); }
   function httpsify(u) { return u ? u.replace(/^http:/, 'https:').replace('&edge=curl', '') : ''; }
+  function isbn13to10(i) {
+    if (!/^978\d{10}$/.test(i)) return '';
+    const core = i.slice(3, 12);
+    let sum = 0;
+    for (let k = 0; k < 9; k++) sum += (+core[k]) * (10 - k);
+    const c = (11 - (sum % 11)) % 11;
+    return core + (c === 10 ? 'X' : c);
+  }
 
   function fromGoogle(v, isbn) {
     const i = v.volumeInfo || {};
@@ -100,35 +117,103 @@
     };
   }
 
+  // --- Source 1 : Google Books (country=FR évite le refus « localisation inconnue »)
+  async function srcGoogle(isbn) {
+    const g = await getJSON('https://www.googleapis.com/books/v1/volumes?q=isbn:' + isbn + '&country=FR');
+    if (!g.items || !g.items.length) return null;
+    return fromGoogle(g.items[0], isbn);
+  }
+  // --- Source 2 : catalogue de la Bibliothèque nationale de France (tous les livres publiés en France)
+  async function srcBnf(isbn) {
+    const q = encodeURIComponent('bib.isbn all "' + isbn + '"');
+    const xml = await httpGet('https://catalogue.bnf.fr/api/SRU?version=1.2&operation=searchRetrieve&query=' + q + '&recordSchema=dublincore&maximumRecords=3', 12000);
+    const doc = new DOMParser().parseFromString(xml, 'text/xml');
+    const rec = doc.getElementsByTagNameNS('*', 'dc')[0];
+    if (!rec) return null;
+    const all = (tag) => Array.from(rec.getElementsByTagNameNS('*', tag)).map((n) => n.textContent.trim()).filter(Boolean);
+    const rawTitle = all('title')[0] || '';
+    if (!rawTitle) return null;
+    // « One piece. 1, À l'aube d'une grande aventure / Eiichiro Oda ; trad. … »
+    const [titlePart, resp = ''] = rawTitle.split(' / ');
+    let series = '', volume = null, title = titlePart.replace(/\s*\[[^\]]*\]\s*/g, ' ').trim();
+    const m = title.match(/^(.+?)\.\s*(?:tome|t\.|vol(?:ume)?\.?)?\s*(\d{1,4})\b\s*[,.:]?\s*(.*)$/i);
+    if (m) { series = m[1].trim(); volume = +m[2]; title = series + ' – Tome ' + volume + (m[3] ? ' – ' + m[3].trim() : ''); }
+    else { const ps = parseSeries(title); series = ps.series; volume = ps.volume; }
+    let authors = all('creator').map((c) => c.replace(/\(.*?\)/g, '').replace(/\..*$/, '').trim())
+      .map((c) => { const p = c.split(',').map((x) => x.trim()); return p.length === 2 ? p[1] + ' ' + p[0] : c; });
+    if (!authors.length && resp) authors = [resp.split(';')[0].trim()];
+    const pub = (all('publisher')[0] || '').replace(/\s*\(.*?\)\s*/g, '').trim();
+    const date = (all('date')[0] || '').match(/\d{4}/);
+    const desc = all('description').join(' ');
+    return { isbn, title, authors: [...new Set(authors)].join(', '), publisher: pub, publishedDate: date ? date[0] : '',
+      pages: null, description: '', cover: '', series, volume, _bnfDesc: desc };
+  }
+  // --- Source 3 : Open Library
+  async function srcOpenLibrary(isbn) {
+    const o = await getJSON('https://openlibrary.org/api/books?bibkeys=ISBN:' + isbn + '&format=json&jscmd=data');
+    const d = o['ISBN:' + isbn];
+    if (!d) return null;
+    const ps = parseSeries(d.title, d.subtitle);
+    return {
+      isbn, title: [d.title, d.subtitle].filter(Boolean).join(' – '),
+      authors: (d.authors || []).map((a) => a.name).join(', '),
+      publisher: (d.publishers || []).map((p) => p.name).join(', '),
+      publishedDate: d.publish_date || '', pages: d.number_of_pages || null,
+      description: '', cover: d.cover ? httpsify(d.cover.medium || d.cover.large || '') : '',
+      series: ps.series, volume: ps.volume,
+    };
+  }
+  // --- Source 4 : Google Books, recherche plein texte (attrape les fiches mal indexées)
+  async function srcGoogleText(isbn) {
+    const g = await getJSON('https://www.googleapis.com/books/v1/volumes?q=' + isbn + '&country=FR&maxResults=3');
+    const it = (g.items || []).find((v) => (v.volumeInfo.industryIdentifiers || []).some((x) => x.identifier.replace(/-/g, '') === isbn || x.identifier === isbn13to10(isbn)));
+    return it ? fromGoogle(it, isbn) : null;
+  }
+
+  let lastLookupReport = [];
   async function lookupIsbn(raw) {
     let isbn = cleanIsbn(raw);
     if (isbn.length === 10) isbn = isbn10to13(isbn);
-    // 1) Google Books
-    try {
-      const g = await getJSON('https://www.googleapis.com/books/v1/volumes?q=isbn:' + isbn);
-      if (g.items && g.items.length) {
-        const b = fromGoogle(g.items[0], isbn);
-        if (!b.cover) b.cover = 'https://covers.openlibrary.org/b/isbn/' + isbn + '-M.jpg?default=false';
-        return b;
-      }
-    } catch (e) { /* on essaie la suite */ }
-    // 2) Open Library
-    try {
-      const o = await getJSON('https://openlibrary.org/api/books?bibkeys=ISBN:' + isbn + '&format=json&jscmd=data');
-      const d = o['ISBN:' + isbn];
-      if (d) {
-        const ps = parseSeries(d.title, d.subtitle);
-        return {
-          isbn, title: [d.title, d.subtitle].filter(Boolean).join(' – '),
-          authors: (d.authors || []).map((a) => a.name).join(', '),
-          publisher: (d.publishers || []).map((p) => p.name).join(', '),
-          publishedDate: d.publish_date || '', pages: d.number_of_pages || null,
-          description: '', cover: d.cover ? httpsify(d.cover.medium || d.cover.large || '') : '',
-          series: ps.series, volume: ps.volume,
-        };
-      }
-    } catch (e) { /* rien */ }
-    return null;
+    const sources = [['Google Books', srcGoogle], ['BnF', srcBnf], ['Open Library', srcOpenLibrary], ['Google (texte)', srcGoogleText]];
+    const results = await Promise.all(sources.map(async ([name, fn]) => {
+      try { const r = await fn(isbn); return { name, r, msg: r ? 'trouvé' : 'inconnu' }; }
+      catch (e) { return { name, r: null, msg: String((e && e.message) || e) }; }
+    }));
+    lastLookupReport = results.map((x) => x.name + ' : ' + x.msg);
+    const found = results.map((x) => x.r).filter(Boolean);
+    if (!found.length) return null;
+    // On fusionne : la première source qui a l'info gagne
+    const pick = (k) => { for (const f of found) if (f[k]) return f[k]; return k === 'volume' || k === 'pages' ? null : ''; };
+    const bnf = results[1].r;
+    const b = {
+      isbn,
+      title: pick('title'), authors: pick('authors'), publisher: pick('publisher'),
+      publishedDate: pick('publishedDate'), pages: pick('pages'), description: pick('description'),
+      cover: pick('cover'),
+      // la BnF découpe très bien « Série. N° » : on la préfère pour la série
+      series: (bnf && bnf.series) || pick('series'), volume: (bnf && bnf.volume) || pick('volume'),
+    };
+    if (bnf && bnf.series && bnf.volume && !/tome|t\.|vol/i.test(b.title)) b.title = bnf.title;
+    if (!b.cover) b.cover = await findCover(isbn);
+    return b;
+  }
+
+  // Couverture de secours : Open Library puis Amazon (via l'ISBN-10)
+  function imageOk(url) {
+    return new Promise((res) => {
+      const im = new Image();
+      const t = setTimeout(() => res(false), 7000);
+      im.onload = () => { clearTimeout(t); res(im.naturalWidth > 20); };
+      im.onerror = () => { clearTimeout(t); res(false); };
+      im.src = url;
+    });
+  }
+  async function findCover(isbn) {
+    const i10 = isbn13to10(isbn);
+    const cands = ['https://covers.openlibrary.org/b/isbn/' + isbn + '-M.jpg?default=false'];
+    if (i10) cands.push('https://images-na.ssl-images-amazon.com/images/P/' + i10 + '.08.LZZZZZZZ.jpg');
+    for (const u of cands) if (await imageOk(u)) return u;
+    return '';
   }
 
   // ---------- Couvertures ----------
@@ -467,7 +552,7 @@
       const ex = seriesList().find((s) => s.key === norm(b.series));
       if (ex) b.series = ex.name;
     }
-    openSheet((found ? '' : `<p class="muted small">Je n’ai pas trouvé ce livre automatiquement. Remplis les infos toi-même :</p>`) + bookForm(b, { isNew: true }));
+    openSheet((found ? '' : `<p class="muted small">Je n’ai pas trouvé ce livre automatiquement. Remplis les infos toi-même :</p><p class="muted small" style="font-size:11px;opacity:.8">${esc(lastLookupReport.join(' · '))}</p>`) + bookForm(b, { isNew: true }));
     wireBookForm(b, true);
   }
 
@@ -488,7 +573,7 @@
       const ownedIsbn = new Set(s.books.map((b) => b.isbn));
       try {
         const q = 'intitle:' + JSON.stringify(s.name);
-        const url = 'https://www.googleapis.com/books/v1/volumes?q=' + encodeURIComponent(q) + '&orderBy=newest&maxResults=40&printType=books';
+        const url = 'https://www.googleapis.com/books/v1/volumes?q=' + encodeURIComponent(q) + '&orderBy=newest&maxResults=40&printType=books&country=FR';
         const data = await getJSON(url);
         const byVol = new Map();
         for (const it of data.items || []) {
