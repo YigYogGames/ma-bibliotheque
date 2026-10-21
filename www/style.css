@@ -219,3 +219,34 @@ select { flex: 1; }
   background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 999px; font-size: 14px; font-weight: 600;
   max-width: 90vw; text-align: center; box-shadow: 0 6px 18px rgba(0,0,0,.3);
 }
+
+/* ===== Scanner intégré ===== */
+html.scanning, html.scanning body { background: transparent !important; }
+html.scanning body > *:not(#scanOverlay) { visibility: hidden; }
+#scanOverlay {
+  position: fixed; inset: 0; z-index: 50; display: flex; flex-direction: column; align-items: center;
+  color: #fff; font-family: var(--font); visibility: visible;
+  padding: calc(14px + var(--safe-top)) 16px calc(20px + var(--safe-bottom));
+}
+.sc-top { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.sc-btn { width: 46px; height: 46px; border-radius: 50%; border: 0; background: rgba(0,0,0,.55); color: #fff; font-size: 20px; cursor: pointer; }
+.sc-btn.on { background: #ffd34d; color: #000; }
+.sc-btn[hidden] { visibility: hidden; display: block; }
+.sc-mode { display: flex; background: rgba(0,0,0,.55); border-radius: 999px; padding: 4px; }
+.sc-chip { border: 0; background: none; color: #fff; padding: 8px 14px; border-radius: 999px; font-weight: 700; font-size: 14px; cursor: pointer; }
+.sc-chip.on { background: #fff; color: #000; }
+.sc-frame {
+  margin-top: 16vh; width: min(82vw, 340px); height: 150px; border-radius: 18px; position: relative;
+  box-shadow: 0 0 0 200vmax rgba(0,0,0,.55); border: 3px solid rgba(255,255,255,.9); transition: border-color .15s;
+}
+.sc-frame.hit { border-color: #3ddc84; box-shadow: 0 0 0 200vmax rgba(0,40,10,.55); }
+.sc-laser { position: absolute; left: 10px; right: 10px; height: 2px; background: #ff3b3b; box-shadow: 0 0 10px #ff3b3b; top: 50%; animation: laser 1.6s ease-in-out infinite alternate; }
+@keyframes laser { from { top: 18%; } to { top: 82%; } }
+.sc-hint { margin-top: 18px; text-align: center; font-weight: 600; text-shadow: 0 1px 3px rgba(0,0,0,.8); max-width: 320px; }
+.sc-list { margin-top: 14px; width: 100%; max-width: 420px; display: grid; gap: 6px; }
+.sc-item { display: flex; gap: 8px; align-items: center; background: rgba(0,0,0,.6); border-radius: 12px; padding: 8px 12px; font-size: 14px; animation: fade .2s; }
+.sc-item .sc-t { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.sc-item.todo { background: rgba(120,70,0,.7); }
+.sc-bottom { margin-top: auto; width: 100%; max-width: 420px; display: flex; gap: 8px; }
+.sc-wide { flex: 1; padding: 14px; border-radius: 14px; border: 0; background: rgba(0,0,0,.6); color: #fff; font-weight: 700; font-size: 15px; cursor: pointer; }
+.sc-wide.primary { background: #fff; color: #000; }

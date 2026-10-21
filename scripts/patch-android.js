@@ -30,8 +30,12 @@ const manifestFile = path.join(root, 'android/app/src/main/AndroidManifest.xml')
 let m = fs.readFileSync(manifestFile, 'utf8');
 if (!m.includes('com.google.mlkit.vision.DEPENDENCIES')) {
   m = m.replace('<application', '<application').replace(/(<application[^>]*>)/,
-    '$1\n        <meta-data android:name="com.google.mlkit.vision.DEPENDENCIES" android:value="barcode_ui" />');
+    '$1\n        <meta-data android:name="com.google.mlkit.vision.DEPENDENCIES" android:value="barcode_ui,barcode" />');
 }
+for (const perm of ['android.permission.CAMERA', 'android.permission.VIBRATE']) {
+  if (!m.includes(perm)) m = m.replace(/(<manifest[^>]*>)/, `$1\n    <uses-permission android:name="${perm}" />`);
+}
+if (!m.includes('android.hardware.camera')) m = m.replace(/(<manifest[^>]*>)/, '$1\n    <uses-feature android:name="android.hardware.camera" android:required="false" />');
 fs.writeFileSync(manifestFile, m);
 
 console.log('Projet Android ajusté, version 0.1.' + run);

@@ -588,9 +588,155 @@
   }
 
   // ---------- Scan ----------
+  const scanner = { active: false, burst: false, torch: false, handle: null, lastCode: '', lastAt: 0, queue: [], busy: false, items: [] };
+  try { scanner.burst = localStorage.getItem('mabiblio.burst') === '1'; } catch (e) { /* rien */ }
+  const getBS = () => window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.BarcodeScanner;
+
+  // Scanner maison : la caméra s'affiche directement dans l'application (rapide, sans fenêtre Google)
   async function startScan() {
-    const BS = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.BarcodeScanner;
+    const BS = getBS();
     if (!isNative() || !BS) { askIsbn('Le scanner fonctionne dans l’application sur téléphone. Ici, tape l’ISBN (le numéro sous le code-barres) :'); return; }
+    if (scanner.active) return;
+    closeSheet();
+    scanner.lastCode = ''; scanner.items = []; scanner.queue = [];
+    try {
+      let perm = await BS.checkPermissions();
+      if (perm.camera !== 'granted') perm = await BS.requestPermissions();
+      if (perm.camera !== 'granted') {
+        toast('Autorise l’appareil photo pour scanner (Paramètres du téléphone → Applis)', 4000);
+        return googleScan();
+      }
+      showScanOverlay();
+      scanner.handle = await BS.addListener('barcodesScanned', (ev) => onLiveCode(ev && ev.barcodes));
+      await BS.startScan({ formats: ['EAN_13', 'EAN_8', 'UPC_A', 'UPC_E'], lensFacing: 'BACK' });
+      scanner.active = true;
+      try { const t = await BS.isTorchAvailable(); scanner.torchAvail = !!t.available; $('#scTorch').hidden = !t.available; } catch (e) { /* rien */ }
+    } catch (e) {
+      await stopScan();
+      googleScan(); // si la caméra intégrée échoue, on garde l'ancien scanner en secours
+    }
+  }
+
+  async function stopScan() {
+    const BS = getBS();
+    scanner.active = false;
+    try { scanner.handle && scanner.handle.remove && (await scanner.handle.remove()); } catch (e) { /* rien */ }
+    scanner.handle = null;
+    try { BS && (await BS.stopScan()); } catch (e) { /* rien */ }
+    if (scanner.torch) { scanner.torch = false; }
+    document.documentElement.classList.remove('scanning');
+    const o = $('#scanOverlay'); if (o) o.remove();
+  }
+
+  function showScanOverlay() {
+    document.documentElement.classList.add('scanning');
+    const o = document.createElement('div');
+    o.id = 'scanOverlay';
+    o.innerHTML = `
+      <div class="sc-top">
+        <button class="sc-btn" id="scClose" aria-label="Fermer">✕</button>
+        <div class="sc-mode">
+          <button class="sc-chip ${scanner.burst ? '' : 'on'}" data-burst="0">Un livre</button>
+          <button class="sc-chip ${scanner.burst ? 'on' : ''}" data-burst="1">Rafale</button>
+        </div>
+        <button class="sc-btn ${scanner.torch ? 'on' : ''}" id="scTorch" aria-label="Lampe" ${scanner.torchAvail ? '' : 'hidden'}>🔦</button>
+      </div>
+      <div class="sc-frame"><span class="sc-laser"></span></div>
+      <div class="sc-hint" id="scHint">${scanner.burst ? 'Mode rafale : scanne tes livres les uns après les autres' : 'Vise le code-barres au dos du livre'}</div>
+      <div class="sc-list" id="scList"></div>
+      <div class="sc-bottom"><button class="sc-wide" id="scManual">Taper l’ISBN</button>${scanner.burst ? '<button class="sc-wide primary" id="scDone">Terminé</button>' : ''}</div>`;
+    document.body.appendChild(o);
+    renderScanList();
+    $('#scClose').onclick = () => finishScan();
+    $('#scManual').onclick = async () => { await finishScan(); askIsbn(); };
+    if ($('#scDone')) $('#scDone').onclick = () => finishScan();
+    $('#scTorch').onclick = async () => { try { await getBS().toggleTorch(); scanner.torch = !scanner.torch; $('#scTorch').classList.toggle('on', scanner.torch); } catch (e) { /* rien */ } };
+    $$('.sc-chip', o).forEach((c) => c.onclick = () => {
+      scanner.burst = c.dataset.burst === '1';
+      try { localStorage.setItem('mabiblio.burst', scanner.burst ? '1' : '0'); } catch (e) { /* rien */ }
+      const keep = scanner.active; o.remove(); showScanOverlay(); scanner.active = keep;
+    });
+  }
+
+  async function finishScan() {
+    await stopScan();
+    const added = scanner.items.filter((i) => i.state === 'ok').length;
+    const todo = scanner.items.filter((i) => i.state === 'todo').length;
+    if (scanner.items.length) toast(`${added} livre${added > 1 ? 's' : ''} ajouté${added > 1 ? 's' : ''}` + (todo ? ` · ${todo} à compléter` : ''), 3500);
+    scanner.items = []; scanner.queue = [];
+    render();
+  }
+
+  function beep() {
+    try { navigator.vibrate && navigator.vibrate(60); } catch (e) { /* rien */ }
+    try {
+      const A = window.AudioContext || window.webkitAudioContext; if (!A) return;
+      const ctx = beep.ctx || (beep.ctx = new A());
+      const os = ctx.createOscillator(), g = ctx.createGain();
+      os.frequency.value = 1150; g.gain.value = 0.08;
+      os.connect(g); g.connect(ctx.destination); os.start(); os.stop(ctx.currentTime + 0.09);
+    } catch (e) { /* rien */ }
+  }
+
+  function onLiveCode(barcodes) {
+    if (!scanner.active || !barcodes || !barcodes.length) return;
+    for (const bc of barcodes) {
+      const code = cleanIsbn(bc.rawValue || bc.displayValue);
+      if (!/^97[89]\d{10}$/.test(code)) {
+        if (code.length >= 8) { const h = $('#scHint'); if (h) h.textContent = 'Ce code n’est pas celui d’un livre (cherche celui qui commence par 978 ou 979)'; }
+        continue;
+      }
+      if (!eanValid(code)) continue; // lecture imparfaite : on attend l'image suivante
+      const now = Date.now();
+      if (code === scanner.lastCode && now - scanner.lastAt < 4000) return; // même livre encore devant la caméra
+      scanner.lastCode = code; scanner.lastAt = now;
+      beep();
+      const fr = $('.sc-frame'); if (fr) { fr.classList.add('hit'); setTimeout(() => fr.classList.remove('hit'), 400); }
+      if (!scanner.burst) { stopScan().then(() => handleCode(code)); return; }
+      queueBurst(code);
+      return;
+    }
+  }
+
+  // ---- Mode rafale : chaque livre est cherché puis ajouté automatiquement
+  function queueBurst(isbn) {
+    if (state.books.some((b) => b.isbn === isbn) || scanner.items.some((i) => i.isbn === isbn)) {
+      scanner.items.unshift({ isbn, state: 'dup', title: (state.books.find((b) => b.isbn === isbn) || {}).title || 'Déjà scanné' });
+      renderScanList(); return;
+    }
+    const it = { isbn, state: 'wait', title: 'Recherche…' };
+    scanner.items.unshift(it); scanner.queue.push(it);
+    renderScanList(); runQueue();
+  }
+  async function runQueue() {
+    if (scanner.busy) return;
+    scanner.busy = true;
+    while (scanner.queue.length) {
+      const it = scanner.queue.shift();
+      let b = null;
+      try { b = await lookupIsbn(it.isbn); } catch (e) { b = null; }
+      if (b && b.title) {
+        if (b.series) { const ex = seriesList().find((s) => s.key === norm(b.series)); if (ex) b.series = ex.name; }
+        state.books.push(Object.assign(b, { id: uid(), addedAt: Date.now() }));
+        it.state = 'ok'; it.title = b.title; it.cover = b.cover;
+      } else {
+        state.books.push({ id: uid(), addedAt: Date.now(), isbn: it.isbn, title: 'À compléter (ISBN ' + it.isbn + ')', authors: '', series: '', volume: null, cover: '', incomplete: true });
+        it.state = 'todo'; it.title = 'Introuvable — ajouté « à compléter »';
+      }
+      save(); renderScanList();
+    }
+    scanner.busy = false;
+    if (!scanner.active) render();
+  }
+  function renderScanList() {
+    const el = $('#scList'); if (!el) return;
+    const icon = { wait: '⏳', ok: '✅', todo: '✏️', dup: '↩️' };
+    el.innerHTML = scanner.items.slice(0, 6).map((i) => `<div class="sc-item ${i.state}"><span>${icon[i.state]}</span><span class="sc-t">${esc(i.title)}</span></div>`).join('');
+  }
+
+  // Ancien scanner (fenêtre Google) : gardé en secours
+  async function googleScan() {
+    const BS = getBS();
     try {
       const avail = await BS.isGoogleBarcodeScannerModuleAvailable().catch(() => ({ available: true }));
       if (!avail.available) {
@@ -889,7 +1035,8 @@
     const App = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
     if (App && App.addListener) {
       App.addListener('backButton', () => {
-        if (!$('#sheetBackdrop').hidden) closeSheet();
+        if (scanner.active || $('#scanOverlay')) finishScan();
+        else if (!$('#sheetBackdrop').hidden) closeSheet();
         else if (currentView !== 'library') show('library');
         else App.exitApp && App.exitApp();
       });

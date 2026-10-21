@@ -2,9 +2,6 @@
   "appId": "com.yigyog.mabibliotheque",
   "appName": "Ma Bibliothèque",
   "webDir": "www",
-  "android": {
-    "backgroundColor": "#1f1712"
-  },
   "plugins": {
     "CapacitorHttp": {
       "enabled": true
