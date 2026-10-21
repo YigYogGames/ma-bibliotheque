@@ -12,7 +12,7 @@ const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SE
   auth: { persistSession: false },
 });
 const GKEY = Deno.env.get("GOOGLE_BOOKS_KEY") || "";
-const CACHE_V = 2; // à augmenter quand la façon de lire les catalogues change
+const CACHE_V = 3; // à augmenter quand la façon de lire les catalogues change
 const clean = (b: any) => { if (!b) return b; const { _m, ...rest } = b; return rest; };
 
 const CORS = {
@@ -238,6 +238,7 @@ async function imgSize(url: string) {
     return (await r.arrayBuffer()).byteLength;
   } catch { return 0; }
 }
+const okImage = async (u: string) => !!u && (await imgSize(u)) > 2500;
 const placeholder: Record<string, number> = {};
 async function realImage(kind: string, url: string, fakeUrl: string) {
   const size = await imgSize(url);
@@ -297,8 +298,8 @@ async function lookup(isbn: string) {
   if (bnf?.series && bnf.volume) b.title = bnf.title;
   if (bnf?.description && !b.description) b.description = bnf.description;
   // couverture : celle signalée par la BnF est fiable et immédiate, sinon on cherche ailleurs
-  if (bnf?.cover) b.cover = bnf.cover;
-  else { const better = await findCover(isbn, b.ark); if (better) b.cover = better; }
+  if (bnf?.cover && (await okImage(bnf.cover))) b.cover = bnf.cover;
+  else { const better = await findCover(isbn, b.ark); if (better) b.cover = better; else if (b.cover && !(await okImage(b.cover))) b.cover = ""; }
   return { book: b, report, networkError: false };
 }
 
@@ -351,6 +352,7 @@ async function volumes(series: string, vols: number[], publisher: string, refIsb
         best = pickVolume(recs, v, key, ref);
       } catch { /* Google ensuite */ }
       if (!best && gIndex.has(v)) best = gIndex.get(v)!;
+      if (best && best.cover && !(await okImage(best.cover))) best.cover = "";
       if (best && best.isbn && !best.cover) best.cover = await findCover(best.isbn, best.ark);
       out[v] = clean(best);
     }
@@ -381,7 +383,7 @@ async function releasesForSeries(name: string, books: any[], report: any) {
     }
   };
   try {
-    const data = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent("intitle:" + JSON.stringify(name)) + "&orderBy=newest&maxResults=40&printType=books")), 3);
+    const data = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent("intitle:" + JSON.stringify(name)) + "&orderBy=newest&maxResults=40&printType=books&langRestrict=fr")), 3);
     for (const it of data.items || []) {
       const b = fromGoogle(it);
       keep({ series: name, volume: b.volume, title: b.title, date: b.publishedDate, isbn: b.isbn, cover: b.cover }, b.series);
@@ -405,12 +407,28 @@ async function releasesForSeries(name: string, books: any[], report: any) {
       } catch (e) { report.bnf.err++; report.bnf.last = String((e as Error)?.message || e); misses++; }
     }
   }
+  // Google, recherche ciblée des prochains numéros (c'est là que se trouvent les dates à venir)
+  const known = Math.max(maxOwned, ...[...byVol.keys()]);
+  if (known) {
+    for (const v of [known + 1, known + 2, known + 3]) {
+      try {
+        const q = "intitle:" + JSON.stringify(name) + " " + v;
+        const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent(q) + "&maxResults=20&printType=books&langRestrict=fr")), 2);
+        for (const it of d.items || []) {
+          const b = fromGoogle(it);
+          if (b.volume === v) keep({ series: name, volume: b.volume, title: b.title, date: b.publishedDate, isbn: b.isbn, cover: b.cover }, b.series);
+        }
+        report.google.ok++;
+      } catch (e) { report.google.err++; report.google.last = String((e as Error)?.message || e); }
+    }
+  }
   const list = [...byVol.values()];
   for (const r of list) {
     r.out = !!(r.out && (!r.date || r.date.length === 4));
     r.id = "srv-" + key.replace(/ /g, "-") + "-" + r.volume;
   }
   // couvertures des sorties (en parallèle, limitées)
+  await Promise.all(list.filter((r) => r.cover).map(async (r) => { if (!(await okImage(r.cover))) r.cover = ""; }));
   await Promise.all(list.filter((r) => !r.cover && r.isbn).slice(0, 6).map(async (r) => { r.cover = await findCover(r.isbn); }));
   return list;
 }

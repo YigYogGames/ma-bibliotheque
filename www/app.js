@@ -453,8 +453,24 @@
   function coverHTML(b) {
     const fake = `<div class="fake-cover" style="background:${hashColor(b.series || b.title)}"><div class="fc-title">${esc(b.title || 'Sans titre')}</div><div class="fc-author">${esc(b.authors || '')}</div></div>`;
     if (!b.cover) return fake;
-    return `<img src="${esc(b.cover)}" alt="" loading="lazy" onerror="this.outerHTML=this.dataset.fb" data-fb="${esc(fake)}">`;
+    return `<img src="${esc(b.cover)}" alt="" loading="lazy" onerror="window.__badCover(this)" data-id="${esc(b.id || '')}" data-fb="${esc(fake)}">`;
   }
+
+  // Image de couverture qui ne s'affiche pas : on met la couverture de secours et on cherche une autre source
+  const badCoverTried = new Set();
+  window.__badCover = (img) => {
+    const id = img.dataset.id;
+    img.outerHTML = img.dataset.fb;
+    if (!id || badCoverTried.has(id)) return;
+    badCoverTried.add(id);
+    const b = state.books.find((x) => x.id === id);
+    if (!b || b.coverPhoto || !b.isbn) return;
+    const bad = b.cover;
+    findCoverAny(b.isbn, b.ark).then((u) => {
+      if (u && u !== bad) b.cover = u; else { b.cover = ''; b.coverTriedAt = Date.now(); }
+      save(); if (!scanner.active) render();
+    }).catch(() => {});
+  };
 
   // ---------- Navigation ----------
   const TITLES = { library: 'Ma bibliothèque', series: 'Mes séries', releases: 'Sorties prévues', settings: 'Réglages' };
