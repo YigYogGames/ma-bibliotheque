@@ -117,19 +117,37 @@
     };
   }
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Réessaie automatiquement quand un service ne répond pas (souvent : « trop de demandes »)
+  async function withRetry(fn, tries = 3, onRetry) {
+    let last;
+    for (let i = 0; i < tries; i++) {
+      try { return await fn(); } catch (e) {
+        last = e;
+        if (i < tries - 1) { onRetry && onRetry(i + 2); await sleep(900 * (i + 1) * (i + 1)); }
+      }
+    }
+    throw last;
+  }
+
   // --- Source 1 : Google Books (country=FR évite le refus « localisation inconnue »)
   async function srcGoogle(isbn) {
-    const g = await getJSON('https://www.googleapis.com/books/v1/volumes?q=isbn:' + isbn + '&country=FR');
-    if (!g.items || !g.items.length) return null;
-    return fromGoogle(g.items[0], isbn);
+    const g = await getJSON('https://www.googleapis.com/books/v1/volumes?q=isbn:' + isbn + '&country=FR', 8000);
+    if (g.items && g.items.length) return fromGoogle(g.items[0], isbn);
+    // recherche plein texte : attrape les fiches mal indexées
+    const g2 = await getJSON('https://www.googleapis.com/books/v1/volumes?q=' + isbn + '&country=FR&maxResults=3', 8000);
+    const it = (g2.items || []).find((v) => (v.volumeInfo.industryIdentifiers || []).some((x) => x.identifier.replace(/-/g, '') === isbn || x.identifier === isbn13to10(isbn)));
+    return it ? fromGoogle(it, isbn) : null;
   }
+
   // --- Source 2 : catalogue de la Bibliothèque nationale de France (tous les livres publiés en France)
-  async function srcBnf(isbn) {
-    const q = encodeURIComponent('bib.isbn all "' + isbn + '"');
-    const xml = await httpGet('https://catalogue.bnf.fr/api/SRU?version=1.2&operation=searchRetrieve&query=' + q + '&recordSchema=dublincore&maximumRecords=3', 12000);
+  async function bnfSearch(cql, max = 5) {
+    const xml = await httpGet('https://catalogue.bnf.fr/api/SRU?version=1.2&operation=searchRetrieve&query=' + encodeURIComponent(cql) + '&recordSchema=dublincore&maximumRecords=' + max, 12000);
     const doc = new DOMParser().parseFromString(xml, 'text/xml');
-    const rec = doc.getElementsByTagNameNS('*', 'dc')[0];
-    if (!rec) return null;
+    if (!doc.getElementsByTagNameNS('*', 'searchRetrieveResponse').length && !doc.getElementsByTagNameNS('*', 'records').length) throw new Error('réponse illisible');
+    return Array.from(doc.getElementsByTagNameNS('*', 'dc')).map(parseBnfRec).filter(Boolean);
+  }
+  function parseBnfRec(rec) {
     const all = (tag) => Array.from(rec.getElementsByTagNameNS('*', tag)).map((n) => n.textContent.trim()).filter(Boolean);
     const rawTitle = all('title')[0] || '';
     if (!rawTitle) return null;
@@ -144,13 +162,20 @@
     if (!authors.length && resp) authors = [resp.split(';')[0].trim()];
     const pub = (all('publisher')[0] || '').replace(/\s*\(.*?\)\s*/g, '').trim();
     const date = (all('date')[0] || '').match(/\d{4}/);
-    const desc = all('description').join(' ');
-    return { isbn, title, authors: [...new Set(authors)].join(', '), publisher: pub, publishedDate: date ? date[0] : '',
-      pages: null, description: '', cover: '', series, volume, _bnfDesc: desc };
+    const ids = all('identifier');
+    const ark = (ids.join(' ').match(/ark:\/12148\/[a-z0-9]+/i) || [])[0] || '';
+    const isbnM = ids.join(' ').replace(/-/g, '').match(/97[89]\d{10}/);
+    return { isbn: isbnM ? isbnM[0] : '', title, authors: [...new Set(authors)].join(', '), publisher: pub,
+      publishedDate: date ? date[0] : '', pages: null, description: '', cover: '', series, volume, ark };
   }
+  async function srcBnf(isbn) {
+    const r = await bnfSearch('bib.isbn all "' + isbn + '"', 3);
+    return r[0] ? Object.assign(r[0], { isbn }) : null;
+  }
+
   // --- Source 3 : Open Library
   async function srcOpenLibrary(isbn) {
-    const o = await getJSON('https://openlibrary.org/api/books?bibkeys=ISBN:' + isbn + '&format=json&jscmd=data');
+    const o = await getJSON('https://openlibrary.org/api/books?bibkeys=ISBN:' + isbn + '&format=json&jscmd=data', 9000);
     const d = o['ISBN:' + isbn];
     if (!d) return null;
     const ps = parseSeries(d.title, d.subtitle);
@@ -163,21 +188,17 @@
       series: ps.series, volume: ps.volume,
     };
   }
-  // --- Source 4 : Google Books, recherche plein texte (attrape les fiches mal indexées)
-  async function srcGoogleText(isbn) {
-    const g = await getJSON('https://www.googleapis.com/books/v1/volumes?q=' + isbn + '&country=FR&maxResults=3');
-    const it = (g.items || []).find((v) => (v.volumeInfo.industryIdentifiers || []).some((x) => x.identifier.replace(/-/g, '') === isbn || x.identifier === isbn13to10(isbn)));
-    return it ? fromGoogle(it, isbn) : null;
-  }
 
   let lastLookupReport = [];
-  async function lookupIsbn(raw) {
+  async function lookupIsbn(raw, onStatus) {
     let isbn = cleanIsbn(raw);
     if (isbn.length === 10) isbn = isbn10to13(isbn);
-    const sources = [['Google Books', srcGoogle], ['BnF', srcBnf], ['Open Library', srcOpenLibrary], ['Google (texte)', srcGoogleText]];
-    const results = await Promise.all(sources.map(async ([name, fn]) => {
-      try { const r = await fn(isbn); return { name, r, msg: r ? 'trouvé' : 'inconnu' }; }
-      catch (e) { return { name, r: null, msg: String((e && e.message) || e) }; }
+    const sources = [['Google Books', srcGoogle, 3], ['BnF', srcBnf, 3], ['Open Library', srcOpenLibrary, 2]];
+    const results = await Promise.all(sources.map(async ([name, fn, tries]) => {
+      try {
+        const r = await withRetry(() => fn(isbn), tries, (n) => onStatus && onStatus(name + ' ne répond pas, essai n°' + n + '…'));
+        return { name, r, msg: r ? 'trouvé' : 'inconnu' };
+      } catch (e) { return { name, r: null, msg: String((e && e.message) || e) }; }
     }));
     lastLookupReport = results.map((x) => x.name + ' : ' + x.msg);
     const found = results.map((x) => x.r).filter(Boolean);
@@ -189,31 +210,102 @@
       isbn,
       title: pick('title'), authors: pick('authors'), publisher: pick('publisher'),
       publishedDate: pick('publishedDate'), pages: pick('pages'), description: pick('description'),
-      cover: pick('cover'),
+      cover: pick('cover'), ark: (bnf && bnf.ark) || '',
       // la BnF découpe très bien « Série. N° » : on la préfère pour la série
       series: (bnf && bnf.series) || pick('series'), volume: (bnf && bnf.volume) || pick('volume'),
     };
     if (bnf && bnf.series && bnf.volume && !/tome|t\.|vol/i.test(b.title)) b.title = bnf.title;
-    if (!b.cover) b.cover = await findCover(isbn);
+    onStatus && onStatus('Recherche de la couverture…');
+    const better = await findCover(b.isbn, b.ark);
+    if (better) b.cover = better;
     return b;
   }
 
-  // Couverture de secours : Open Library puis Amazon (via l'ISBN-10)
+  // ---------- Recherche de couverture (plusieurs sources) ----------
   function imageOk(url) {
     return new Promise((res) => {
       const im = new Image();
-      const t = setTimeout(() => res(false), 7000);
-      im.onload = () => { clearTimeout(t); res(im.naturalWidth > 20); };
+      const t = setTimeout(() => res(false), 8000);
+      im.onload = () => { clearTimeout(t); res(im.naturalWidth > 20 && im.naturalHeight > 20); };
       im.onerror = () => { clearTimeout(t); res(false); };
       im.src = url;
     });
   }
-  async function findCover(isbn) {
+  // Certains services renvoient une image « pas de couverture » au lieu d'une erreur :
+  // on télécharge l'image en natif et on la compare à cette image-type.
+  async function nativeSize(url) {
+    const H = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.CapacitorHttp;
+    if (!isNative() || !H) return -1;
+    try {
+      const r = await H.get({ url, responseType: 'blob', connectTimeout: 8000, readTimeout: 8000 });
+      if (r.status !== 200 || typeof r.data !== 'string') return 0;
+      return r.data.length;
+    } catch (e) { return 0; }
+  }
+  const placeholderSizes = {};
+  async function realImage(kind, url, fakeUrl) {
+    const size = await nativeSize(url);
+    if (size === -1) return false;          // hors application : on ne peut pas vérifier
+    if (size < 2500) return false;           // trop petit = vide
+    if (!(kind in placeholderSizes)) placeholderSizes[kind] = await nativeSize(fakeUrl);
+    return Math.abs(size - placeholderSizes[kind]) > 64 && imageOk(url);
+  }
+  async function findCover(isbn, ark) {
+    if (!isbn) return '';
     const i10 = isbn13to10(isbn);
-    const cands = ['https://covers.openlibrary.org/b/isbn/' + isbn + '-M.jpg?default=false'];
-    if (i10) cands.push('https://images-na.ssl-images-amazon.com/images/P/' + i10 + '.08.LZZZZZZZ.jpg');
-    for (const u of cands) if (await imageOk(u)) return u;
+    // 1) Amazon (très complet pour les livres français en 978)
+    if (i10) {
+      for (const u of ['https://images-na.ssl-images-amazon.com/images/P/' + i10 + '.01.LZZZZZZZ.jpg', 'https://m.media-amazon.com/images/P/' + i10 + '.01._SCLZZZZZZZ_.jpg']) {
+        if (await imageOk(u)) return u;
+      }
+    }
+    // 2) BnF (couvertures fournies par les éditeurs, y compris les ISBN en 979)
+    let a = ark;
+    if (!a) { try { const r = await bnfSearch('bib.isbn all "' + isbn + '"', 1); a = r[0] && r[0].ark; } catch (e) { /* rien */ } }
+    if (a) {
+      const u = 'https://catalogue.bnf.fr/couverture?&appName=NE&idArk=' + a + '&couverture=1';
+      if (await realImage('bnf', u, 'https://catalogue.bnf.fr/couverture?&appName=NE&idArk=ark:/12148/cb00000000x&couverture=1')) return u;
+    }
+    // 3) Open Library
+    const ol = 'https://covers.openlibrary.org/b/isbn/' + isbn + '-L.jpg?default=false';
+    if (await imageOk(ol)) return ol;
+    // 4) Google Books (image directe par ISBN)
+    const g = 'https://books.google.com/books/content?vid=ISBN' + isbn + '&printsec=frontcover&img=1&zoom=1';
+    if (await realImage('google', g, 'https://books.google.com/books/content?vid=ISBN9780000000002&printsec=frontcover&img=1&zoom=1')) return g;
     return '';
+  }
+
+  // Photo de couverture prise par l'utilisateur : réduite pour ne pas prendre trop de place
+  function photoToCover(file) {
+    return new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onerror = rej;
+      fr.onload = () => {
+        const im = new Image();
+        im.onerror = rej;
+        im.onload = () => {
+          const h = 420, w = Math.round(im.width * (h / im.height));
+          const c = document.createElement('canvas'); c.width = w; c.height = h;
+          c.getContext('2d').drawImage(im, 0, 0, w, h);
+          res(c.toDataURL('image/jpeg', 0.72));
+        };
+        im.src = fr.result;
+      };
+      fr.readAsDataURL(file);
+    });
+  }
+
+  // Au démarrage : on retente de trouver les couvertures manquantes (tous les 3 jours par livre)
+  async function repairCovers() {
+    const todo = state.books.filter((b) => !b.cover && b.isbn && (!b.coverTriedAt || Date.now() - b.coverTriedAt > 3 * 864e5));
+    let fixed = 0;
+    for (const b of todo.slice(0, 15)) {
+      const u = await findCover(b.isbn, b.ark).catch(() => '');
+      b.coverTriedAt = Date.now();
+      if (u) { b.cover = u; fixed++; }
+      save();
+    }
+    if (fixed) { render(); toast(fixed + ' couverture' + (fixed > 1 ? 's' : '') + ' retrouvée' + (fixed > 1 ? 's' : '')); }
   }
 
   // ---------- Couvertures ----------
@@ -362,15 +454,17 @@
 
   function renderReleases() {
     const el = $('#releasesContent');
-    $('#lastCheck').textContent = state.lastCheck ? 'Dernière recherche : ' + new Date(state.lastCheck).toLocaleString('fr-FR', { dateStyle: 'medium', timeStyle: 'short' }) : '';
+    const rp = state.lastReport;
+    const rpTxt = rp ? ` · Google Books : ${rp.google.err ? rp.google.err + ' échec(s)' + (rp.google.last ? ' (' + rp.google.last + ')' : '') : 'OK'} · BnF : ${rp.bnf.err ? rp.bnf.err + ' échec(s)' + (rp.bnf.last ? ' (' + rp.bnf.last + ')' : '') : 'OK'}` : '';
+    $('#lastCheck').textContent = state.lastCheck ? 'Dernière recherche : ' + new Date(state.lastCheck).toLocaleString('fr-FR', { dateStyle: 'medium', timeStyle: 'short' }) + rpTxt : '';
     if (!seriesList().length) {
       el.innerHTML = `<div class="empty"><div class="big">📅</div><h2>Pas encore de série</h2><p>Ajoute des livres qui font partie d'une série, puis reviens ici : je chercherai les prochains tomes et leurs dates de sortie.</p></div>`;
       return;
     }
     const all = visibleReleases();
     const today = todayKey();
-    const upcoming = all.filter((r) => dateKey(r.date) >= today && r.date).sort((a, b) => dateKey(a.date).localeCompare(dateKey(b.date)));
-    const past = all.filter((r) => r.date && dateKey(r.date) < today).sort((a, b) => dateKey(b.date).localeCompare(dateKey(a.date)));
+    const upcoming = all.filter((r) => isUpcoming(r)).sort((a, b) => dateKey(a.date).localeCompare(dateKey(b.date)));
+    const past = all.filter((r) => r.date && !isUpcoming(r)).sort((a, b) => dateKey(b.date).localeCompare(dateKey(a.date)));
     const nodate = all.filter((r) => !r.date);
     if (!all.length) {
       el.innerHTML = `<div class="empty"><p>${state.lastCheck ? 'Aucune nouvelle sortie trouvée pour tes séries. Tu peux en ajouter une à la main si tu connais la date.' : 'Appuie sur « Chercher les nouveautés » pour trouver les prochains tomes de tes séries.'}</p></div>`;
@@ -396,7 +490,7 @@
 
   function renderBadge() {
     const today = todayKey();
-    const n = visibleReleases().filter((r) => r.date && dateKey(r.date) >= today).length;
+    const n = visibleReleases().filter((r) => isUpcoming(r)).length;
     const b = $('#releaseBadge');
     b.hidden = !n; b.textContent = n;
   }
@@ -453,9 +547,10 @@
       };
       if (!upd.title) return toast('Il faut au moins un titre');
       if (isNew) {
-        state.books.push(Object.assign({}, b, upd, { id: uid(), addedAt: Date.now() }));
+        const nb = Object.assign({}, b, upd, { id: uid(), addedAt: Date.now() });
+        state.books.push(nb);
         save(); closeSheet(); render();
-        afterAdd(upd);
+        afterAdd(nb);
       } else {
         Object.assign(b, upd); save(); closeSheet(); render(); toast('Modifications enregistrées');
       }
@@ -464,8 +559,11 @@
 
   function afterAdd(b) {
     openSheet(`<h2>✅ Ajouté !</h2><p class="muted">« ${esc(b.title)} » est maintenant dans ta bibliothèque.</p>
+      ${!b.cover ? '<p class="muted small">Pas de couverture trouvée pour ce livre. Tu peux la prendre en photo.</p>' : ''}
       <div class="sheet-actions"><button class="btn primary block" data-act="scan-again">Scanner un autre livre</button>
+      ${!b.cover ? '<button class="btn block" id="addCoverNow">📷 Ajouter la couverture</button>' : ''}
       <button class="btn ghost block" data-act="close">Terminé</button></div>`);
+    const c = $('#addCoverNow'); if (c) c.onclick = () => coverMenu(b, () => afterAdd(b));
   }
 
   function openBook(id) {
@@ -482,6 +580,7 @@
       </div></div>
       ${b.description ? `<div class="desc">${esc(b.description)}</div>` : ''}
       <div class="sheet-actions">
+        <button class="btn block" data-act="cover" data-id="${b.id}">🖼️ ${b.cover ? 'Changer la couverture' : 'Ajouter une couverture'}</button>
         <button class="btn block" data-act="edit" data-id="${b.id}">✏️ Modifier</button>
         <button class="btn danger block" data-act="delete" data-id="${b.id}">🗑️ Retirer de ma bibliothèque</button>
         <button class="btn ghost block" data-act="close">Fermer</button>
@@ -501,7 +600,7 @@
       }
       const res = await BS.scan({ formats: ['EAN_13', 'EAN_8', 'UPC_A', 'UPC_E'] });
       const code = res && res.barcodes && res.barcodes[0] && (res.barcodes[0].rawValue || res.barcodes[0].displayValue);
-      if (code) handleCode(code);
+      if (code) handleCode(code, true);
     } catch (e) {
       const msg = String(e && (e.message || e)).toLowerCase();
       if (msg.includes('cancel')) return;
@@ -532,9 +631,22 @@
     setTimeout(() => { const i = $('#isbnForm input'); i && i.focus(); }, 150);
   }
 
-  async function handleCode(code) {
+  // Contrôle du code EAN-13 : évite les lectures erronées du scanner
+  function eanValid(c) {
+    if (!/^\d{13}$/.test(c)) return true;
+    let sum = 0;
+    for (let k = 0; k < 12; k++) sum += (+c[k]) * (k % 2 ? 3 : 1);
+    return (10 - (sum % 10)) % 10 === +c[12];
+  }
+
+  async function handleCode(code, fromScan) {
     const isbn = cleanIsbn(code);
     if (isbn.length !== 13 && isbn.length !== 10) { toast('Ce code ne ressemble pas à un ISBN'); return; }
+    if (!eanValid(isbn)) {
+      if (fromScan) { toast('Code mal lu, on recommence…'); setTimeout(startScan, 600); }
+      else toast('Ce numéro contient une erreur, vérifie-le');
+      return;
+    }
     const n13 = isbn.length === 10 ? isbn10to13(isbn) : isbn;
     const dup = state.books.find((b) => b.isbn === n13);
     if (dup) {
@@ -544,19 +656,96 @@
         <button class="btn ghost block" data-act="close">Fermer</button></div>`);
       return;
     }
-    openSheet(`<h2>Recherche du livre…</h2><p class="muted small">ISBN ${esc(n13)}</p><div class="spinner"></div>`);
-    const found = await lookupIsbn(n13);
+    openSheet(`<h2>Recherche du livre…</h2><p class="muted small">ISBN ${esc(n13)}</p><div class="spinner"></div><p class="muted small" id="lookupStatus" style="text-align:center"></p>`);
+    const status = (t) => { const el = $('#lookupStatus'); if (el) el.textContent = t; };
+    let found = await lookupIsbn(n13, status);
+    // Dernière chance : tout a échoué à cause du réseau → on patiente et on recommence une fois
+    if (!found && lastLookupReport.some((l) => !/inconnu|trouvé/.test(l))) {
+      status('Connexion difficile, dernier essai…');
+      await sleep(2500);
+      found = await lookupIsbn(n13, status);
+    }
     const b = found || { isbn: n13, title: '', authors: '', publisher: '', publishedDate: '', cover: '', series: '', volume: null };
     // Si une série existante ressemble, on reprend son nom exact
     if (b.series) {
       const ex = seriesList().find((s) => s.key === norm(b.series));
       if (ex) b.series = ex.name;
     }
-    openSheet((found ? '' : `<p class="muted small">Je n’ai pas trouvé ce livre automatiquement. Remplis les infos toi-même :</p><p class="muted small" style="font-size:11px;opacity:.8">${esc(lastLookupReport.join(' · '))}</p>`) + bookForm(b, { isNew: true }));
+    const notFound = `<p class="muted small">Je n’ai pas trouvé ce livre automatiquement.</p>
+      <button class="btn block" type="button" id="retryLookup" style="margin-bottom:10px">↻ Réessayer la recherche</button>
+      <p class="muted small" style="font-size:11px;opacity:.8">${esc(lastLookupReport.join(' · '))}</p><p class="muted small">Ou remplis les infos toi-même :</p>`;
+    openSheet((found ? '' : notFound) + bookForm(b, { isNew: true }));
     wireBookForm(b, true);
+    const rb = $('#retryLookup'); if (rb) rb.addEventListener('click', () => handleCode(n13));
+  }
+
+  // ---------- Choix de la couverture ----------
+  function coverMenu(b, onDone) {
+    openSheet(`<h2>Couverture</h2><div style="display:flex;justify-content:center;margin-bottom:12px"><div class="detail-cover">${coverHTML(b)}</div></div>
+      <div class="sheet-actions">
+        <button class="btn primary block" id="cvPhoto">📷 Prendre en photo / choisir une image</button>
+        ${b.isbn ? '<button class="btn block" id="cvSearch">🔎 Chercher automatiquement</button>' : ''}
+        ${b.cover ? '<button class="btn danger block" id="cvRemove">Retirer la couverture</button>' : ''}
+        <button class="btn ghost block" id="cvBack">Retour</button>
+      </div><input type="file" id="cvFile" accept="image/*" hidden>`);
+    $('#cvBack').onclick = onDone;
+    $('#cvPhoto').onclick = () => $('#cvFile').click();
+    $('#cvFile').onchange = async (e) => {
+      const f = e.target.files[0]; if (!f) return;
+      try { b.cover = await photoToCover(f); b.coverPhoto = true; save(); render(); toast('Couverture enregistrée'); onDone(); }
+      catch (err) { toast('Impossible de lire cette image'); }
+    };
+    if ($('#cvSearch')) $('#cvSearch').onclick = async () => {
+      $('#cvSearch').textContent = 'Recherche…'; $('#cvSearch').disabled = true;
+      const u = await findCover(b.isbn, b.ark).catch(() => '');
+      if (u) { b.cover = u; b.coverPhoto = false; save(); render(); toast('Couverture trouvée 🎉'); onDone(); }
+      else { toast('Aucune couverture trouvée, essaie une photo'); $('#cvSearch').textContent = '🔎 Chercher automatiquement'; $('#cvSearch').disabled = false; }
+    };
+    if ($('#cvRemove')) $('#cvRemove').onclick = () => { b.cover = ''; save(); render(); onDone(); };
   }
 
   // ---------- Recherche des sorties ----------
+  // Une série : on cherche les tomes suivants dans Google Books (dates à venir) et à la BnF (déjà parus)
+  async function releasesForSeries(s, report) {
+    const vols = s.books.map((b) => b.volume).filter(Boolean);
+    const maxOwned = vols.length ? Math.max(...vols) : 0;
+    const ownedIsbn = new Set(s.books.map((b) => b.isbn));
+    const byVol = new Map();
+    const keep = (r) => {
+      if (!r._s || norm(r._s) !== s.key || !r.volume) return;
+      delete r._s;
+      if (vols.includes(r.volume) || ownedIsbn.has(r.isbn) || r.volume < maxOwned) return;
+      const prev = byVol.get(r.volume);
+      // priorité à la date la plus précise (jour > mois > année)
+      const prec = (d) => String(d || '').split('-').length;
+      if (!prev || prec(r.date) > prec(prev.date) || (prec(r.date) === prec(prev.date) && dateKey(r.date) > dateKey(prev.date))) {
+        byVol.set(r.volume, Object.assign({ id: uid() }, prev || {}, r, { cover: r.cover || (prev && prev.cover) || '' }));
+      }
+    };
+    // Google Books
+    try {
+      const q = 'intitle:' + JSON.stringify(s.name);
+      const data = await withRetry(() => getJSON('https://www.googleapis.com/books/v1/volumes?q=' + encodeURIComponent(q) + '&orderBy=newest&maxResults=40&printType=books&country=FR', 9000), 3);
+      for (const it of data.items || []) {
+        const b = fromGoogle(it);
+        keep({ series: s.name, volume: b.volume, title: b.title, date: b.publishedDate, isbn: b.isbn, cover: b.cover, _s: b.series });
+      }
+      report.google.ok++;
+    } catch (e) { report.google.err++; report.google.last = String(e.message || e); }
+    // BnF : on demande directement les 2 tomes suivants
+    if (maxOwned) {
+      for (const v of [maxOwned + 1, maxOwned + 2]) {
+        try {
+          const recs = await withRetry(() => bnfSearch('bib.title all "' + s.name.replace(/"/g, '') + '" and bib.title all "' + v + '"', 10), 2);
+          for (const r of recs) if (r.volume === v) keep({ series: s.name, volume: r.volume, title: r.title, date: r.publishedDate, isbn: r.isbn, cover: '', out: true, _s: r.series });
+          report.bnf.ok++;
+        } catch (e) { report.bnf.err++; report.bnf.last = String(e.message || e); }
+        await sleep(250);
+      }
+    }
+    return [...byVol.values()];
+  }
+
   async function checkReleases() {
     const series = seriesList();
     if (!series.length) { toast('Ajoute d’abord des livres d’une série'); return; }
@@ -564,43 +753,28 @@
     btn.disabled = true;
     const keepManual = state.releases.filter((r) => r.manual);
     const found = [];
-    let i = 0, errors = 0;
+    const report = { google: { ok: 0, err: 0, last: '' }, bnf: { ok: 0, err: 0, last: '' } };
+    let i = 0;
     for (const s of series) {
       i++;
       btn.textContent = `Recherche… ${i}/${series.length}`;
-      const vols = s.books.map((b) => b.volume).filter(Boolean);
-      const maxOwned = vols.length ? Math.max(...vols) : 0;
-      const ownedIsbn = new Set(s.books.map((b) => b.isbn));
-      try {
-        const q = 'intitle:' + JSON.stringify(s.name);
-        const url = 'https://www.googleapis.com/books/v1/volumes?q=' + encodeURIComponent(q) + '&orderBy=newest&maxResults=40&printType=books&country=FR';
-        const data = await getJSON(url);
-        const byVol = new Map();
-        for (const it of data.items || []) {
-          const b = fromGoogle(it);
-          if (!b.series || norm(b.series) !== s.key || !b.volume) continue;
-          if (b.volume <= maxOwned && vols.includes(b.volume)) continue;
-          if (ownedIsbn.has(b.isbn)) continue;
-          if (b.volume < maxOwned) continue; // les trous sont déjà visibles dans « Séries »
-          const prev = byVol.get(b.volume);
-          // on garde l'édition la plus récente et datée
-          if (!prev || dateKey(b.publishedDate) > dateKey(prev.date)) {
-            byVol.set(b.volume, { id: uid(), series: s.name, volume: b.volume, title: b.title, date: b.publishedDate, isbn: b.isbn, cover: b.cover });
-          }
-        }
-        found.push(...byVol.values());
-      } catch (e) { errors++; }
-      await new Promise((r) => setTimeout(r, 350)); // on reste poli avec le service
+      found.push(...await releasesForSeries(s, report));
+      await sleep(700); // on reste poli avec les services
     }
+    // Une sortie trouvée seulement à la BnF est déjà parue (la BnF enregistre les livres à leur sortie)
+    for (const r of found) r.out = !!(r.out && (!r.date || r.date.length === 4));
     state.releases = keepManual.concat(found.filter((f) => !keepManual.some((m) => relKey(m) === relKey(f))));
     state.lastCheck = Date.now();
+    state.lastReport = report;
     save();
     btn.disabled = false; btn.textContent = '↻ Chercher les nouveautés';
     render();
-    const up = visibleReleases().filter((r) => r.date && dateKey(r.date) >= todayKey()).length;
-    if (errors === series.length) toast('Pas de connexion Internet ?');
-    else toast(up ? `${up} sortie${up > 1 ? 's' : ''} à venir trouvée${up > 1 ? 's' : ''} 🎉` : 'Recherche terminée');
+    const up = visibleReleases().filter((r) => isUpcoming(r)).length;
+    const allFailed = report.google.ok === 0 && report.bnf.ok === 0;
+    if (allFailed) toast('Les catalogues ne répondent pas, réessaie dans quelques minutes', 4000);
+    else toast(up ? `${up} sortie${up > 1 ? 's' : ''} à venir trouvée${up > 1 ? 's' : ''} 🎉` : 'Recherche terminée : rien de nouveau pour l’instant');
   }
+  function isUpcoming(r) { return r.date && !r.out && dateKey(r.date) >= todayKey(); }
 
   function addReleaseManually() {
     const names = seriesList();
@@ -702,6 +876,7 @@
       if (act === 'close') closeSheet();
       if (act === 'scan-again') { closeSheet(); startScan(); }
       if (act === 'open') openBook(a.dataset.id);
+      if (act === 'cover') { const b = state.books.find((x) => x.id === a.dataset.id); coverMenu(b, () => openBook(b.id)); }
       if (act === 'edit') { const b = state.books.find((x) => x.id === a.dataset.id); openSheet(bookForm(b, { isNew: false })); wireBookForm(b, false); }
       if (act === 'delete') {
         if (a.dataset.confirm) {
@@ -726,6 +901,9 @@
   applyTheme();
   wire();
   render();
+
+  // Couvertures manquantes
+  setTimeout(() => repairCovers().catch(() => {}), 1500);
 
   // Recherche automatique des sorties une fois par semaine
   if (seriesList().length && (!state.lastCheck || Date.now() - state.lastCheck > 7 * 864e5)) {
