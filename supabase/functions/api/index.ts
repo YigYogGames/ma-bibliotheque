@@ -314,9 +314,17 @@ async function srcLeslibraires(isbn: string) {
     preorder: /schema\.org\/PreOrder/.test(html), src: "Leslibraires",
   };
 }
-// Place des Libraires (réseau de librairies indépendantes) : recherche par ISBN
+// Place des Libraires : une seule demande à la fois, espacées ; si le site dit « trop de demandes », on attend
+async function pdlSearch(query: string) {
+  let last: unknown;
+  for (let i = 0; i < 3; i++) {
+    try { return await hostLimited("pdl", () => placeDesLibraires(query), 1500); }
+    catch (e) { last = e; await sleep(/429/.test(String((e as Error)?.message)) ? 6000 * (i + 1) : 1500); }
+  }
+  throw last;
+}
 async function srcPdl(isbn: string) {
-  const list = await withRetry(() => hostLimited("pdl", () => placeDesLibraires(isbn), 400), 2);
+  const list = await pdlSearch(isbn);
   const r = list.find((x: any) => x.isbn === isbn);
   if (!r) return null;
   return { ...r, publishedDate: r.date };
@@ -578,22 +586,29 @@ async function releasesForSeries(name: string, books: any[], report: any) {
   // 2) Les 3 numéros suivants, demandés à plusieurs sites en même temps
   const next = latest ? [latest + 1, latest + 2, latest + 3] : [];
   const tasks: Promise<void>[] = [];
+  let pdlFailed = true, googleFailed = true, pdlPartial = false;
   const run = (srcName: string, fn: () => Promise<any[]>) => tasks.push((async () => {
     const rk = srcName === "Google Books" ? "google" : srcName === "Decitre" ? "decitre" : "pdl";
     report[rk] = report[rk] || { ok: 0, err: 0, last: "" };
-    try { for (const r of await fn()) keep(r); report[rk].ok++; }
+    try {
+      for (const r of await fn()) keep(r);
+      report[rk].ok++;
+      if (rk === "pdl") pdlFailed = false;
+      if (rk === "google") googleFailed = false;
+    }
     catch (e) { report[rk].err++; report[rk].last = String((e as Error)?.message || e); }
   })());
   // Place des Libraires : les numéros l'un après l'autre (le site n'aime pas les demandes simultanées)
   run("Place des Libraires", async () => {
     const all: any[] = [];
-    for (const v of next) { all.push(...await withRetry(() => placeDesLibraires(name + " " + v), 3)); await sleep(400); }
+    let ok = 0;
+    for (const v of next) { try { all.push(...await pdlSearch(name + " " + v)); ok++; } catch (e) { pdlPartial = true; if (!ok && v === next[next.length - 1]) throw e; } }
     return all;
   });
   for (const v of next) {
     run("Google Books", async () => {
       const q = "intitle:" + JSON.stringify(name) + " " + v;
-      const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent(q) + "&maxResults=20&printType=books&langRestrict=fr")), 2);
+      const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent(q) + "&maxResults=20&printType=books&langRestrict=fr")), 3);
       return (d.items || []).map((it: any) => { const b = fromGoogle(it); return { ...b, date: b.publishedDate, src: "Google Books" }; });
     });
   }
@@ -605,7 +620,7 @@ async function releasesForSeries(name: string, books: any[], report: any) {
     return (d.items || []).map((it: any) => { const b = fromGoogle(it); return { ...b, date: b.publishedDate, src: "Google Books" }; });
   });
   await Promise.all(tasks);
-  const list = [...byVol.values()];
+  const list: any = [...byVol.values()];
   // Leslibraires : confirme la date exacte et donne une belle couverture
   for (const r of list.filter((x) => x.isbn).slice(0, 4)) {
     try {
@@ -621,7 +636,7 @@ async function releasesForSeries(name: string, books: any[], report: any) {
   report.ll = report.ll || { ok: 0, err: 0, last: "" }; report.ll.ok++;
   await Promise.all(list.filter((r) => r.cover && !/leslibraires/.test(r.cover)).map(async (r) => { if (!(await okImage(r.cover))) r.cover = ""; }));
   await Promise.all(list.filter((r) => !r.cover && r.isbn).slice(0, 6).map(async (r) => { r.cover = await findCover(r.isbn); }));
-  return list;
+  return { list, failed: pdlFailed || pdlPartial };
 }
 const SERIES_TTL = 6 * 3600e3; // une série est revérifiée au plus toutes les 6 heures
 async function computeReleases(libraryId: string) {
@@ -637,6 +652,9 @@ async function computeReleases(libraryId: string) {
   const report: any = { google: { ok: 0, err: 0, last: "" }, bnf: { ok: 0, err: 0, last: "" }, pdl: { ok: 0, err: 0, last: "" }, decitre: { ok: 0, err: 0, last: "" }, ll: { ok: 0, err: 0, last: "" } };
   const series = [...groups.values()];
   const releases: any[] = [];
+  const { data: prevRow } = await db.from("library_releases").select("releases").eq("library_id", libraryId).maybeSingle();
+  const prev: any[] = prevRow?.releases || [];
+  const today = new Date().toISOString().slice(0, 10);
   const started = Date.now();
   let lastSave = 0;
   const saveProgress = async (done: boolean) => {
@@ -655,8 +673,17 @@ async function computeReleases(libraryId: string) {
       let list: any[];
       if (cached && Date.now() - new Date(cached.checked_at).getTime() < SERIES_TTL) list = cached.data || [];
       else {
-        list = await releasesForSeries(s.name, s.books, report);
-        await db.from("series_cache").upsert({ key, data: list, checked_at: new Date().toISOString() });
+        const res = await releasesForSeries(s.name, s.books, report);
+        list = res.list;
+        if (res.failed) {
+          // sites indisponibles : on garde ce qu'on savait déjà, et on réessaiera dans 30 minutes
+          const old = (cached?.data || []).concat(prev.filter((r) => norm(r.series) === norm(s.name)));
+          const seen = new Set(list.map((r) => r.volume));
+          for (const r of old) if (!seen.has(r.volume) && dateKey(r.date) >= today) { seen.add(r.volume); list.push(r); }
+          await db.from("series_cache").upsert({ key, data: list, checked_at: new Date(Date.now() - SERIES_TTL + 30 * 60e3).toISOString() });
+        } else {
+          await db.from("series_cache").upsert({ key, data: list, checked_at: new Date().toISOString() });
+        }
       }
       const ownedIsbn = new Set(s.books.map((b) => b.isbn));
       releases.push(...list.filter((r) => !ownedIsbn.has(r.isbn) && !vols.includes(r.volume)));
