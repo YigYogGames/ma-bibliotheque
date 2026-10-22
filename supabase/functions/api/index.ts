@@ -1,10 +1,10 @@
 // @ts-nocheck
 // Serveur de Ma Bibliothèque (Supabase Edge Function)
-// - lookup  : fiche d'un livre par ISBN (Google Books + BnF + Open Library, avec mémoire partagée)
+// - lookup  : fiche d'un livre par ISBN (BnF, Leslibraires, Place des Libraires, Google Books, Open Library, Decitre, avec mémoire partagée)
 // - cover   : recherche de couverture
 // - volumes : infos de plusieurs tomes d'une série (pour « ajouter les tomes précédents »)
 // - register / sync : sauvegarde et synchronisation de la bibliothèque
-// - releases : sorties prévues (calculées à la demande et chaque nuit)
+// - releases : sorties prévues (calculées en arrière-plan, à l'ouverture de l'appli et chaque nuit)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
@@ -12,7 +12,7 @@ const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SE
   auth: { persistSession: false },
 });
 const GKEY = Deno.env.get("GOOGLE_BOOKS_KEY") || "";
-const CACHE_V = 3; // à augmenter quand la façon de lire les catalogues change
+const CACHE_V = 5; // à augmenter quand la façon de lire les catalogues change
 const clean = (b: any) => { if (!b) return b; const { _m, ...rest } = b; return rest; };
 
 const CORS = {
@@ -26,7 +26,7 @@ const json = (body: unknown, status = 200) =>
 // ---------- Outils ----------
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const norm = (s: string) =>
-  String(s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+  String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
 
 async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
   let last: unknown;
@@ -85,7 +85,7 @@ function fromGoogle(v: any, isbn = ""): Book {
     authors: (i.authors || []).join(", "), publisher: i.publisher || "", publishedDate: i.publishedDate || "",
     pages: i.pageCount || null, description: String(i.description || "").replace(/<[^>]+>/g, ""),
     cover: String(img.thumbnail || img.smallThumbnail || "").replace(/^http:/, "https:").replace("&edge=curl", ""),
-    series: ps.series, volume: ps.volume,
+    series: ps.series, volume: ps.volume, subjects: i.categories || [],
   };
 }
 async function srcGoogle(isbn: string) {
@@ -100,7 +100,7 @@ async function srcGoogle(isbn: string) {
 
 // ---------- BnF : format UNIMARC (champs structurés : série, tome, titre, auteurs…) ----------
 const xmlDecode = (s) => String(s).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
-  .replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n)).replace(/&amp;/g, '&').trim();
+  .replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n)).replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16))).replace(/&amp;/g, '&').trim();
 function marcFields(rec, tag) {
   const out = [];
   const re = new RegExp('<mxc:datafield tag="' + tag + '"[^>]*>([\\s\\S]*?)</mxc:datafield>', 'g');
@@ -150,13 +150,14 @@ function parseUnimarc(rec) {
   const isbn = (sub(marcFields(rec, '073')[0], 'a') || sub(marcFields(rec, '010')[0], 'a')).replace(/[^0-9X]/gi, '');
   const pages = +((sub(marcFields(rec, '215')[0], 'a').match(/(\d+)\s*p\./) || [])[1] || 0) || null;
   const hasCover = marcFields(rec, '856').some((f) => /couverture/i.test(sub(f, 'b')));
+  const subjects = marcFields(rec, '608').concat(marcFields(rec, '606')).map((f) => sub(f, 'a')).filter(Boolean);
   const price = parseFloat((sub(marcFields(rec, '010')[0], 'd').match(/\d+(?:[.,]\d+)?/) || ['0'])[0].replace(',', '.')) || 0;
   const size = (sub(marcFields(rec, '215')[0], 'd').match(/\d+/) || [''])[0];
   return {
     isbn: /^97[89]\d{10}$/.test(isbn) ? isbn : '', title, authors: [...new Set(authors)].join(', '),
     publisher: sub(pubF, 'c'), publishedDate: year, pages, description: sub(marcFields(rec, '330')[0], 'a'),
     cover: hasCover && ark ? 'https://catalogue.bnf.fr/couverture?&appName=NE&idArk=' + ark + '&couverture=1' : '',
-    series, volume, ark,
+    series, volume, ark, subjects, collection: colls.join(', '),
     // indices pour reconnaître la même édition (format, prix, collection) et écarter les produits dérivés
     _m: { main: norm(main), sub: norm(subt), colls, price, size },
   };
@@ -266,40 +267,147 @@ async function findCover(isbn: string, ark?: string) {
   return "";
 }
 
+// ---------- Sites de libraires, par ISBN ----------
+// Certains sites refusent les demandes trop rapprochées : une file d'attente par site
+const hostQueue: Record<string, Promise<unknown>> = {};
+function hostLimited<T>(host: string, fn: () => Promise<T>, gap = 700): Promise<T> {
+  const prev = hostQueue[host] || Promise.resolve();
+  const run = prev.catch(() => {}).then(fn);
+  hostQueue[host] = run.catch(() => {}).then(() => sleep(gap));
+  return run;
+}
+const pageRetry = (host: string, url: string, timeout = 15000) =>
+  withRetry(() => hostLimited(host, () => getPage(url, timeout)), 3);
+
+// Leslibraires.fr : fiche complète (série + numéro, date exacte, rayon Manga/Littérature, grande couverture)
+async function srcLeslibraires(isbn: string) {
+  const html = await pageRetry("leslibraires", "https://www.leslibraires.fr/recherche/?q=" + isbn);
+  if (!html.includes('itemprop="gtin13" content="' + isbn + '"')) return null;
+  const g = (re: RegExp) => (html.match(re) || [])[1] || "";
+  const row = (label: string) => g(new RegExp('<th scope="row">' + label + '</th>\\s*<td[^>]*>([\\s\\S]*?)</td>'));
+  const crumbs = [...html.matchAll(/"@type": "ListItem", "position": \d+, "name": "([^"]+)"/g)].map((m) => xmlDecode(m[1]));
+  const rayons = [...new Set(crumbs.filter((c) => !/^(accueil|livres|occasion)$/i.test(c)))].slice(0, -1);
+  const serieCell = row("Série");
+  const series = strip((serieCell.match(/<a[^>]*>([\s\S]*?)<\/a>/) || [])[1] || "");
+  const volume = +((serieCell.match(/\((\d{1,4})\)/) || [])[1] || 0) || null;
+  const h1 = strip(g(/<h1 class="product-details__title"[^>]*>([\s\S]*?)<\/h1>/));
+  // sous-titre : ce qui suit « - » s'il ne répète pas le nom de la série
+  let part = (h1.split(" - ").slice(1).join(" - ") || "").trim();
+  if (part && series && norm(part).includes(norm(series))) part = "";
+  // les noms en lien (« Prénom Nom ») d'abord, puis les autres
+  const h2s = [...html.matchAll(/<h2 class="product-details__author"[^>]*>([\s\S]*?)<\/h2>/g)].map((m) => m[1]);
+  const names = h2s.flatMap((h) => [...h.matchAll(/<a[^>]*>([\s\S]*?)<\/a>/g)].map((a) => strip(a[1])))
+    .concat(h2s.map((h) => strip(h).replace(/^(dessins?|sc[ée]nario|texte|traduction|traduit|illustrations?|adaptation|couleurs?)\s+(de|par)\s+/i, "")));
+  const seen = new Set<string>(); const authors: string[] = [];
+  for (const n of names) { const k = norm(n).split(" ").sort().join(" "); if (n && !seen.has(k)) { seen.add(k); authors.push(n); } }
+  let cover = g(/<img[^>]*itemprop="image"[^>]*src="([^"]+)"/);
+  if (cover.startsWith("//")) cover = "https:" + cover;
+  const collection = strip(row("Collection"));
+  return {
+    isbn, series, volume,
+    title: series && volume ? series + " – Tome " + volume + (part ? " – " + part : "") : h1,
+    authors: authors.join(", "), publisher: strip(row("Éditeur")),
+    publishedDate: g(/itemprop="datePublished" datetime="(\d{4}-\d{2}-\d{2})"/),
+    pages: +g(/itemprop="numberOfPages">(\d+)/) || null,
+    description: strip(g(/<p itemprop="description">([\s\S]*?)<\/p>/)),
+    cover: cover.replace("/s:800:800/", "/s:600:600/"), collection, subjects: rayons.concat(collection ? [collection] : []),
+    preorder: /schema\.org\/PreOrder/.test(html), src: "Leslibraires",
+  };
+}
+// Place des Libraires (réseau de librairies indépendantes) : recherche par ISBN
+async function srcPdl(isbn: string) {
+  const list = await withRetry(() => hostLimited("pdl", () => placeDesLibraires(isbn), 400), 2);
+  const r = list.find((x: any) => x.isbn === isbn);
+  if (!r) return null;
+  return { ...r, publishedDate: r.date };
+}
+// Decitre (secours) : la page du livre contient un bloc de données
+async function srcDecitre(isbn: string) {
+  const html = await pageRetry("decitre", "https://www.decitre.fr/rechercher/result?q=" + isbn, 20000);
+  const path = (html.match(new RegExp('"path":"(/livres/[^"]+-' + isbn + '\\.html)"')) || [])[1];
+  if (!path) return null;
+  const page = await pageRetry("decitre", "https://www.decitre.fr" + path, 20000);
+  const ld = [...page.matchAll(/<script[^>]*application\/ld\+json[^>]*>([\s\S]*?)<\/script>/g)].map((m) => { try { return JSON.parse(m[1]); } catch { return null; } })
+    .flat().find((x: any) => x && (x["@type"] === "Book" || x["@type"] === "Product"));
+  if (!ld) return null;
+  const title = xmlDecode(String(ld.name || ""));
+  const ps = parseSeries(title);
+  const auth = [].concat(ld.author || []).map((a: any) => typeof a === "string" ? a : a?.name).filter(Boolean).join(", ");
+  return { isbn, title, authors: auth, publisher: (ld.publisher && (ld.publisher.name || ld.publisher)) || "",
+    publishedDate: String(ld.datePublished || "").slice(0, 10), pages: +ld.numberOfPages || null, description: strip(String(ld.description || "")),
+    cover: "https://products-images.di-static.com/image/x/" + isbn + "-475x500-1.jpg", series: ps.series, volume: ps.volume, subjects: [], src: "Decitre" };
+}
+
+// ---------- Catégorie : roman ou manga (les BD et comics vont avec les mangas) ----------
+const MANGA_PUB = ["pika", "kana", "ki oon", "kioon", "kurokawa", "tonkam", "kaze", "doki doki", "akata", "soleil manga", "crunchyroll",
+  "noeve", "mangetsu", "meian", "glenat manga", "panini manga", "black box", "ototo", "taifu", "nobi nobi", "kbooks", "sakka", "naban",
+  "isan manga", "omake", "lezard noir", "imho", "vega", "dupuis manga", "kotoji", "hikari", "komikku", "mana books", "h2t", "shiba",
+  "bamboo manga", "michel lafon manga", "nazca", "delcourt tonkam", "ankama", "casterman sakka", "fleurus manga", "rue de sevres manga"];
+function categorize(parts: any[]): string {
+  const txt = " " + norm(parts.flat().filter(Boolean).join(" ")) + " ";
+  if (/ (mangas?|shonen|shounen|seinen|shojo|shoujo|josei|kodomo|webtoons?|manhwa|manhua|bandes? dessinees?|bd|comics?|graphic novels?|comic books?) /.test(txt)) return "manga";
+  if (MANGA_PUB.some((p) => txt.includes(" " + p + " "))) return "manga";
+  return "roman";
+}
+
 // ---------- Recherche d'un livre ----------
 async function lookup(isbn: string) {
-  const sources: [string, (i: string) => Promise<Book | null>][] = [
-    ["Google Books", srcGoogle], ["BnF", srcBnf], ["Open Library", srcOpenLibrary],
+  const sources: [string, (i: string) => Promise<any>][] = [
+    ["BnF", srcBnf], ["Leslibraires", srcLeslibraires], ["Place des Libraires", srcPdl], ["Google Books", srcGoogle], ["Open Library", srcOpenLibrary],
   ];
-  // Dès qu'une source a trouvé, on laisse 1,5 s aux autres pour compléter, pas plus
   const results: any[] = sources.map(([name]) => ({ name, r: null, msg: "trop lent" }));
-  let gotHit: () => void = () => {};
-  const hit = new Promise<void>((res) => (gotHit = res));
+  let gotMain: () => void = () => {};
+  const main = new Promise<void>((res) => (gotMain = res));
+  let gotAny: () => void = () => {};
+  const any = new Promise<void>((res) => (gotAny = res));
   const all = Promise.all(sources.map(async ([name, fn], i) => {
     try {
-      const r = await withRetry(() => fn(isbn), name === "Google Books" ? 2 : 3);
+      const r = await withRetry(() => fn(isbn), name === "Google Books" ? 2 : 1);
       results[i] = { name, r, msg: r ? "trouvé" : "inconnu" };
-      if (r) gotHit();
+      if (r) { gotAny(); if (name === "BnF" || name === "Leslibraires") gotMain(); }
     } catch (e) { results[i] = { name, r: null, msg: String((e as Error)?.message || e) }; }
   }));
-  await Promise.race([all, hit]);
-  await Promise.race([all, sleep(1500)]);
+  // On répond dès qu'une source principale a trouvé (+1,2 s pour compléter), ou 3 s après une autre source
+  await Promise.race([all, main, any.then(() => sleep(3000))]);
+  await Promise.race([all, sleep(1200)]);
+  let found = results.map((x) => x.r).filter(Boolean);
+  // Rien trouvé : on essaie Decitre en secours
+  if (!found.length) {
+    try { const d = await srcDecitre(isbn); if (d) { results.push({ name: "Decitre", r: d, msg: "trouvé" }); found = [d]; } }
+    catch (e) { results.push({ name: "Decitre", r: null, msg: String((e as Error)?.message || e) }); }
+  }
   const report = results.map((x) => x.name + " : " + x.msg);
-  const found = results.map((x) => x.r).filter(Boolean) as Book[];
   if (!found.length) return { book: null, report, networkError: results.some((x) => !/inconnu|trouvé/.test(x.msg)) };
-  const pick = (k: keyof Book) => { for (const f of found) if (f[k]) return f[k]; return k === "volume" || k === "pages" ? null : ""; };
-  const bnf = results[1].r;
-  const b: Book = {
-    isbn, title: pick("title") as string, authors: pick("authors") as string, publisher: pick("publisher") as string,
-    publishedDate: pick("publishedDate") as string, pages: pick("pages") as number | null,
-    description: pick("description") as string, cover: pick("cover") as string, ark: bnf?.ark || "",
-    series: bnf?.series || (pick("series") as string), volume: bnf?.volume || (pick("volume") as number | null),
+  const R = (n: string) => results.find((x) => x.name === n)?.r || null;
+  const bnf = R("BnF"), ll = R("Leslibraires"), pdl = R("Place des Libraires"), gg = R("Google Books");
+  const first = (...vals: any[]) => vals.find((v) => v !== undefined && v !== null && v !== "") ?? "";
+  const pickAll = (k: string) => first(...found.map((f: any) => f[k]));
+  const series = first(bnf?.series && bnf?.volume ? bnf.series : "", ll?.series, pickAll("series"));
+  let volume = first(bnf?.series && bnf?.volume ? bnf.volume : "", ll?.volume, ...found.filter((f: any) => f.series && norm(f.series) === norm(series)).map((f: any) => f.volume)) || null;
+  // numéro de tome caché dans un titre (« The Ones - tome 1 … »)
+  if (series && !volume) for (const f of found) { const ps = parseSeries(f.title || ""); if (ps.volume && norm(ps.series).includes(norm(series))) { volume = ps.volume; break; } }
+  // dates : uniquement au format AAAA, AAAA-MM ou AAAA-MM-JJ, la plus précise d'abord (libraires en priorité)
+  const isoDate = (d: string) => { const m = String(d || "").match(/^(\d{4})(-\d{2})?(-\d{2})?/); if (m) return m[0]; const y = String(d || "").match(/\b(1[89]\d{2}|20\d{2})\b/); return y ? y[1] : ""; };
+  const dates = [ll, pdl, bnf, gg, ...found].filter(Boolean).map((f: any) => isoDate(f.publishedDate || f.date)).filter(Boolean)
+    .sort((x: string, y: string) => y.length - x.length);
+  let title = first(bnf?.series && bnf?.volume ? bnf.title : "", ll?.volume ? ll.title : "", ll?.title, pickAll("title"));
+  if (series && volume && !/tome/i.test(title)) title = series + " – Tome " + volume;
+  else if (series && volume && norm(title).startsWith(norm(series) + " " + norm(series))) title = series + " – Tome " + volume;
+  const b: any = {
+    isbn, title,
+    authors: first(bnf?.authors, ll?.authors, pickAll("authors")),
+    publisher: first(ll?.publisher, bnf?.publisher, pdl?.publisher, pickAll("publisher")),
+    publishedDate: dates[0] || "",
+    pages: first(ll?.pages, gg?.pages, pickAll("pages")) || null,
+    description: first(ll?.description, bnf?.description, gg?.description, pdl?.description, pickAll("description")),
+    series, volume, ark: bnf?.ark || "", collection: first(ll?.collection, pdl?.collection, bnf?.collection),
   };
-  if (bnf?.series && bnf.volume) b.title = bnf.title;
-  if (bnf?.description && !b.description) b.description = bnf.description;
-  // couverture : celle signalée par la BnF est fiable et immédiate, sinon on cherche ailleurs
-  if (bnf?.cover && (await okImage(bnf.cover))) b.cover = bnf.cover;
-  else { const better = await findCover(isbn, b.ark); if (better) b.cover = better; else if (b.cover && !(await okImage(b.cover))) b.cover = ""; }
+  b.category = categorize([found.map((f: any) => [f.subjects, f.collection]), b.publisher, b.collection]);
+  // couverture : Leslibraires (grande et fiable), puis BnF vérifiée, puis les autres sources
+  const cands = [ll?.cover, bnf?.cover, pdl?.cover, gg?.cover, pickAll("cover")].filter(Boolean);
+  b.cover = "";
+  for (const c of cands) { if (c === ll?.cover || (await okImage(c))) { b.cover = c; break; } }
+  if (!b.cover) b.cover = await findCover(isbn, b.ark);
   return { book: b, report, networkError: false };
 }
 
@@ -387,9 +495,13 @@ async function placeDesLibraires(query: string) {
     const title = strip((block.match(/<a [^>]*>([\s\S]*?)<\/a>/) || [])[1] || "");
     const publisher = strip((block.match(/itemprop="publisher">([\s\S]*?)</) || [])[1] || "");
     const date = frDate(strip((block.match(/class="MiseEnLigne">([\s\S]*?)</) || [])[1] || ""));
+    const collection = strip((block.match(/class="collection[^"]*">\s*<span>([\s\S]*?)<\/span>/) || [])[1] || "");
+    const authors = strip((block.match(/class="livre_auteur"[^>]*title="([^"]*)"/) || [])[1] || "");
+    const description = strip((block.match(/class="livre_resume[^"]*">([\s\S]*?)<\/p>/) || [])[1] || "");
     if (!isbn || !title) continue;
     const ps = parseSeries(title);
     out.push({ isbn, title, publisher, date, series: ps.series, volume: ps.volume, src: "Place des Libraires",
+      collection, authors, description, subjects: [collection],
       cover: "https://images.epagine.fr/" + isbn.slice(-3) + "/" + isbn + "_1_m.jpg" });
   }
   return out;
@@ -494,11 +606,24 @@ async function releasesForSeries(name: string, books: any[], report: any) {
   });
   await Promise.all(tasks);
   const list = [...byVol.values()];
+  // Leslibraires : confirme la date exacte et donne une belle couverture
+  for (const r of list.filter((x) => x.isbn).slice(0, 4)) {
+    try {
+      const ll = await srcLeslibraires(r.isbn);
+      if (ll) {
+        if (ll.publishedDate) r.date = ll.publishedDate;
+        if (ll.cover) r.cover = ll.cover;
+        r.sources = [...new Set([...(r.sources || []), "Leslibraires"])];
+      }
+    } catch { /* on garde ce qu'on a */ }
+  }
   for (const r of list) { r.out = false; r.id = "srv-" + key.replace(/ /g, "-") + "-" + r.volume; }
-  await Promise.all(list.filter((r) => r.cover).map(async (r) => { if (!(await okImage(r.cover))) r.cover = ""; }));
+  report.ll = report.ll || { ok: 0, err: 0, last: "" }; report.ll.ok++;
+  await Promise.all(list.filter((r) => r.cover && !/leslibraires/.test(r.cover)).map(async (r) => { if (!(await okImage(r.cover))) r.cover = ""; }));
   await Promise.all(list.filter((r) => !r.cover && r.isbn).slice(0, 6).map(async (r) => { r.cover = await findCover(r.isbn); }));
   return list;
 }
+const SERIES_TTL = 6 * 3600e3; // une série est revérifiée au plus toutes les 6 heures
 async function computeReleases(libraryId: string) {
   const { data: rows } = await db.from("library_books").select("data").eq("library_id", libraryId).eq("deleted", false);
   const books = (rows || []).map((r) => r.data).filter(Boolean);
@@ -509,17 +634,38 @@ async function computeReleases(libraryId: string) {
     if (!groups.has(k)) groups.set(k, { name: b.series, books: [] });
     groups.get(k)!.books.push(b);
   }
-  const report = { google: { ok: 0, err: 0, last: "" }, bnf: { ok: 0, err: 0, last: "" }, pdl: { ok: 0, err: 0, last: "" }, decitre: { ok: 0, err: 0, last: "" } };
+  const report: any = { google: { ok: 0, err: 0, last: "" }, bnf: { ok: 0, err: 0, last: "" }, pdl: { ok: 0, err: 0, last: "" }, decitre: { ok: 0, err: 0, last: "" }, ll: { ok: 0, err: 0, last: "" } };
   const series = [...groups.values()];
   const releases: any[] = [];
+  const started = Date.now();
+  let lastSave = 0;
+  const saveProgress = async (done: boolean) => {
+    await db.from("library_releases").upsert({ library_id: libraryId, releases, report,
+      checked_at: new Date().toISOString(), running_since: done ? null : new Date(started).toISOString() });
+  };
   const work = series.slice();
   const worker = async () => {
-    while (work.length) { const s = work.shift()!; releases.push(...await releasesForSeries(s.name, s.books, report)); }
+    while (work.length) {
+      const s = work.shift()!;
+      const vols = s.books.map((b) => b.volume).filter(Boolean);
+      const maxOwned = vols.length ? Math.max(...vols) : 0;
+      const last = s.books.find((b) => b.volume === maxOwned) || s.books[0];
+      const key = norm(s.name) + "|" + pubWord(last?.publisher || "") + "|" + maxOwned;
+      const { data: cached } = await db.from("series_cache").select("data, checked_at").eq("key", key).maybeSingle();
+      let list: any[];
+      if (cached && Date.now() - new Date(cached.checked_at).getTime() < SERIES_TTL) list = cached.data || [];
+      else {
+        list = await releasesForSeries(s.name, s.books, report);
+        await db.from("series_cache").upsert({ key, data: list, checked_at: new Date().toISOString() });
+      }
+      const ownedIsbn = new Set(s.books.map((b) => b.isbn));
+      releases.push(...list.filter((r) => !ownedIsbn.has(r.isbn) && !vols.includes(r.volume)));
+      if (Date.now() - lastSave > 4000) { lastSave = Date.now(); await saveProgress(false); }
+    }
   };
   await Promise.all([worker(), worker()]); // 2 séries à la fois
-  const row = { library_id: libraryId, releases, report, checked_at: new Date().toISOString() };
-  await db.from("library_releases").upsert(row);
-  return row;
+  await saveProgress(true);
+  return { library_id: libraryId, releases, report, checked_at: new Date().toISOString() };
 }
 
 // ---------- Bibliothèques (sans compte : un identifiant + un code secret) ----------
@@ -570,6 +716,14 @@ Deno.serve(async (req) => {
 
     if (action === "ping") return json({ ok: true });
     if (action === "lookup") return json(await cachedLookup(body.isbn));
+    if (action === "lookupMany") {
+      const isbns = (body.isbns || []).slice(0, 8);
+      const out: Record<string, any> = {};
+      const work = isbns.slice();
+      const worker = async () => { while (work.length) { const i = work.shift(); try { out[i] = (await cachedLookup(i)).book; } catch { out[i] = null; } } };
+      await Promise.all([worker(), worker(), worker()]);
+      return json({ books: out });
+    }
     if (action === "cover") return json({ cover: await findCover(String(body.isbn || ""), body.ark) });
     if (action === "volumes") return json({ volumes: await volumes(String(body.series || ""), (body.volumes || []).map(Number).filter((n: number) => n > 0), String(body.publisher || ""), String(body.refIsbn || "")) });
 
@@ -586,9 +740,20 @@ Deno.serve(async (req) => {
     if (action === "releases") {
       if (!(await auth(body.id, body.secret))) return json({ error: "code de bibliothèque invalide" }, 401);
       const { data: cur } = await db.from("library_releases").select("*").eq("library_id", body.id).maybeSingle();
-      const stale = !cur?.checked_at || Date.now() - new Date(cur.checked_at).getTime() > 20 * 3600e3;
-      if (body.refresh || stale) return json(await computeReleases(body.id));
-      return json(cur);
+      const stale = !cur?.checked_at || Date.now() - new Date(cur.checked_at).getTime() > 6 * 3600e3;
+      const running = cur?.running_since && Date.now() - new Date(cur.running_since).getTime() < 4 * 60e3;
+      let refreshing = !!running;
+      if ((body.refresh || stale) && !running) {
+        refreshing = true;
+        await db.from("library_releases").upsert({ library_id: body.id, releases: cur?.releases || [], report: cur?.report || null,
+          checked_at: cur?.checked_at || null, running_since: new Date().toISOString() });
+        const task = computeReleases(body.id).catch(async () => {
+          await db.from("library_releases").update({ running_since: null }).eq("library_id", body.id);
+        });
+        // @ts-ignore EdgeRuntime existe sur Supabase
+        if (typeof EdgeRuntime !== "undefined" && EdgeRuntime.waitUntil) EdgeRuntime.waitUntil(task); else await task;
+      }
+      return json({ ...(cur || { releases: [] }), refreshing });
     }
     if (action === "cron") {
       const { data: cfg } = await db.from("app_config").select("value").eq("key", "cron_key").maybeSingle();

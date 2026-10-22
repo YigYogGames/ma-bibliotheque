@@ -337,3 +337,24 @@ html.scanning body > *:not(#scanOverlay) { visibility: hidden; }
 .theme-card .tc-deco { font-size: 20px; margin-left: auto; padding-bottom: 2px; }
 .theme-card .tc-plank { height: 9px; background: var(--plank); box-shadow: 0 6px 8px -4px var(--plank-shadow); }
 .theme-card .tc-name { display: block; padding: 8px 10px; font-weight: 700; font-size: 14px; color: var(--text); background: var(--bg2); }
+
+/* ===== Bibliothèques Romans / Mangas ===== */
+.topbar { padding-bottom: 8px; }
+.cat-switch { display: flex; gap: 6px; margin-top: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 4px; }
+.cat-switch[hidden] { display: none; }
+.cat-btn { flex: 1; border: 0; background: none; padding: 8px 6px; border-radius: 9px; font-weight: 700; font-size: 14px; display: flex; align-items: center; justify-content: center; gap: 6px; cursor: pointer; color: var(--muted); transition: background .15s, color .15s; }
+.cat-btn.on { background: var(--accent); color: var(--accent-text); }
+.cat-n { font-size: 11px; font-weight: 800; min-width: 20px; padding: 1px 6px; border-radius: 10px; background: rgba(0,0,0,.15); }
+.cat-btn.on .cat-n { background: rgba(255,255,255,.25); }
+
+/* ===== Recherche des sorties en cours ===== */
+.rel-status { display: flex; align-items: center; gap: 10px; margin: 12px 16px 0; padding: 10px 12px; border-radius: 12px; background: var(--surface); border: 1px solid var(--border); font-size: 13px; font-weight: 600; }
+.rel-status[hidden] { display: none; }
+.mini-spin { width: 16px; height: 16px; flex: 0 0 16px; border: 2.5px solid var(--surface2); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+
+/* ===== Fluidité ===== */
+button, .book, .tab, .list-item, .rel, .theme-card, .cat-btn { touch-action: manipulation; }
+.shelf-row, .list-item, .series-card, .rel { content-visibility: auto; contain-intrinsic-size: auto 180px; }
+.book img, .thumb img { background: var(--surface2); }
+.sheet { will-change: transform; }
+.view.active { animation-duration: .12s; }

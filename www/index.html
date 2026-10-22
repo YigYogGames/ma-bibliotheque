@@ -11,6 +11,7 @@
   <header class="topbar">
     <h1 id="viewTitle">Ma bibliothèque</h1>
     <div class="topbar-sub" id="viewSub"></div>
+    <div class="cat-switch" id="catSwitch" role="tablist" aria-label="Bibliothèque"></div>
   </header>
 
   <main id="main">
@@ -44,9 +45,9 @@
     <!-- SORTIES -->
     <section class="view" id="view-releases">
       <div class="releases-head">
-        <button class="btn primary" id="checkReleasesBtn">↻ Chercher les nouveautés</button>
         <button class="btn ghost" id="addReleaseBtn">+ Ajouter à la main</button>
       </div>
+      <div class="rel-status" id="relStatus" hidden><span class="mini-spin"></span>Recherche des nouveautés sur les sites des libraires…</div>
       <div class="muted small" id="lastCheck"></div>
       <div id="releasesContent"></div>
     </section>
@@ -87,7 +88,7 @@
       </div>
       <div class="card">
         <h3>À propos</h3>
-        <p class="muted small" id="aboutText">Ma Bibliothèque — version 0.7. Infos des livres : catalogue de la BnF, Google Books et Open Library.</p>
+        <p class="muted small" id="aboutText">Ma Bibliothèque — version 0.8. Infos des livres : catalogue de la BnF, Google Books et Open Library.</p>
       </div>
     </section>
   </main>

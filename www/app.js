@@ -355,7 +355,7 @@
       if (!u) return;
       b.cover = u; b.coverTriedAt = Date.now();
       const pv = $('#previewCover'); if (pv) pv.innerHTML = coverHTML(b);
-      if (state.books.includes(b)) { save(); if (!scanner.active) render(); }
+      if (state.books.includes(b)) { save(); scheduleRender(); }
     }).catch(() => {});
   }
 
@@ -443,7 +443,7 @@
       if (u) { b.cover = u; fixed++; }
       save();
     }
-    if (fixed) { render(); toast(fixed + ' couverture' + (fixed > 1 ? 's' : '') + ' retrouvée' + (fixed > 1 ? 's' : '')); }
+    if (fixed) { scheduleRender(); toast(fixed + ' couverture' + (fixed > 1 ? 's' : '') + ' retrouvée' + (fixed > 1 ? 's' : '')); }
   }
 
   // ---------- Couvertures ----------
@@ -454,7 +454,7 @@
   function coverHTML(b) {
     const fake = `<div class="fake-cover" style="background:${hashColor(b.series || b.title)}"><div class="fc-title">${esc(b.title || 'Sans titre')}</div><div class="fc-author">${esc(b.authors || '')}</div></div>`;
     if (!b.cover) return fake;
-    return `<img src="${esc(b.cover)}" alt="" loading="lazy" onerror="window.__badCover(this)" data-id="${esc(b.id || '')}" data-fb="${esc(fake)}">`;
+    return `<img src="${esc(b.cover)}" alt="" loading="lazy" decoding="async" onerror="window.__badCover(this)" data-id="${esc(b.id || '')}" data-fb="${esc(fake)}">`;
   }
 
   // Image de couverture qui ne s'affiche pas : on met la couverture de secours et on cherche une autre source
@@ -469,7 +469,7 @@
     const bad = b.cover;
     findCoverAny(b.isbn, b.ark).then((u) => {
       if (u && u !== bad) b.cover = u; else { b.cover = ''; b.coverTriedAt = Date.now(); }
-      save(); if (!scanner.active) render();
+      save(); scheduleRender();
     }).catch(() => {});
   };
 
@@ -488,14 +488,86 @@
   ];
   const themeOf = (id) => THEMES.find((t) => t.id === id) || THEMES[0];
   function themeCardsHTML() {
-    return '<div class="theme-grid">' + THEMES.map((t) => `<button class="theme-card ${t.id === state.settings.theme ? 'active' : ''}" data-theme="${t.id}" data-pick-theme="${t.id}">
+    return '<div class="theme-grid">' + THEMES.map((t) => `<button class="theme-card ${t.id === curTheme() ? 'active' : ''}" data-theme="${t.id}" data-pick-theme="${t.id}">
       <span class="tc-wall">${t.books.map((c, i) => `<span class="tc-book" style="background:${c};height:${[52, 60, 46][i]}px"></span>`).join('')}<span class="tc-deco">${t.deco[0] || ''}</span></span>
       <span class="tc-plank"></span><span class="tc-name">${esc(t.name)}</span></button>`).join('') + '</div>';
   }
-  function pickTheme(id) { state.settings.theme = id; save(); applyTheme(); render(); }
+  function curTheme() { const t = state.settings.themes || {}; return t[curCat()] || state.settings.theme || 'bois'; }
+  function pickTheme(id) { state.settings.themes = Object.assign({}, state.settings.themes, { [curCat()]: id }); save(); applyTheme(); render(); }
   function openShelfPicker() {
-    openSheet(`<h2>Choisir une étagère</h2>${themeCardsHTML()}<div class="sheet-actions"><button class="btn ghost block" data-act="close">Fermer</button></div>`);
+    openSheet(`<h2>Étagère des ${CATS[curCat()].label.toLowerCase()}</h2>${themeCardsHTML()}<div class="sheet-actions"><button class="btn ghost block" data-act="close">Fermer</button></div>`);
     $$('[data-pick-theme]', $('#sheetBody')).forEach((c) => c.onclick = () => { pickTheme(c.dataset.pickTheme); openShelfPicker(); });
+  }
+
+  // ---------- Bibliothèques Romans / Mangas ----------
+  const CATS = { roman: { label: 'Romans', one: 'roman', icon: '📖' }, manga: { label: 'Mangas', one: 'manga', icon: '🎌' } };
+  const MANGA_PUB = ['pika', 'kana', 'ki oon', 'kioon', 'kurokawa', 'tonkam', 'kaze', 'doki doki', 'akata', 'soleil manga', 'crunchyroll',
+    'noeve', 'mangetsu', 'meian', 'glenat manga', 'panini manga', 'black box', 'ototo', 'taifu', 'nobi nobi', 'kbooks', 'sakka', 'naban',
+    'isan manga', 'omake', 'lezard noir', 'imho', 'vega', 'dupuis manga', 'kotoji', 'hikari', 'komikku', 'mana books', 'h2t', 'shiba',
+    'bamboo manga', 'michel lafon manga', 'nazca', 'delcourt tonkam', 'ankama', 'fleurus manga'];
+  function guessCategory(parts) {
+    const txt = ' ' + norm(parts.filter(Boolean).join(' ')) + ' ';
+    if (/ (mangas?|shonen|shounen|seinen|shojo|shoujo|josei|kodomo|webtoons?|manhwa|manhua|bandes? dessinees?|bd|comics?) /.test(txt)) return 'manga';
+    if (MANGA_PUB.some((p) => txt.includes(' ' + p + ' '))) return 'manga';
+    return '';
+  }
+  // Catégorie d'un livre : la sienne, sinon celle de sa série, sinon une supposition
+  let seriesCatCache = null;
+  function seriesCats() {
+    if (seriesCatCache) return seriesCatCache;
+    const m = {};
+    for (const b of state.books) if (b.series && b.category) m[norm(b.series)] = m[norm(b.series)] || b.category;
+    return (seriesCatCache = m);
+  }
+  function catOf(b) {
+    if (b.category) return b.category;
+    const sc = b.series && seriesCats()[norm(b.series)];
+    return sc || guessCategory([b.collection, b.publisher, b.title]) || 'roman';
+  }
+  function curCat() {
+    if (state.settings.cat) return state.settings.cat;
+    const hasManga = state.books.some((b) => catOf(b) === 'manga'), hasRoman = state.books.some((b) => catOf(b) === 'roman');
+    return hasManga && !hasRoman ? 'manga' : 'roman';
+  }
+  const catBooks = (cat = curCat()) => state.books.filter((b) => catOf(b) === cat);
+  function setCat(cat) {
+    if (cat === curCat() && state.settings.cat) return;
+    state.settings.cat = cat; saveLocal(); applyTheme(); libSig = ''; window.scrollTo(0, 0); render();
+  }
+  function renderCatSwitch() {
+    const el = $('#catSwitch'); if (!el) return;
+    el.hidden = currentView === 'settings';
+    const c = curCat();
+    const counts = { roman: 0, manga: 0 };
+    for (const b of state.books) counts[catOf(b)]++;
+    el.innerHTML = Object.entries(CATS).map(([k, v]) => `<button class="cat-btn ${k === c ? 'on' : ''}" data-cat="${k}"><span>${v.icon}</span>${v.label}<span class="cat-n">${counts[k]}</span></button>`).join('');
+  }
+  function moveBooks(books, cat) {
+    for (const b of books) { b.category = cat; b.catManual = true; }
+    seriesCatCache = null; save(); render();
+  }
+
+  // Livres déjà dans la bibliothèque : on demande leur catégorie au serveur (en arrière-plan)
+  let classifying = false;
+  async function classifyLibrary() {
+    if (classifying) return;
+    classifying = true;
+    try {
+      const todo = state.books.filter((b) => !b.category && b.isbn && !b.catTriedAt);
+      for (let i = 0; i < todo.length; i += 6) {
+        const chunk = todo.slice(i, i + 6);
+        let res = {};
+        try { res = (await api('lookupMany', { isbns: chunk.map((b) => b.isbn) }, 90000)).books || {}; } catch (e) { break; }
+        for (const b of chunk) {
+          const f = res[b.isbn];
+          b.catTriedAt = Date.now();
+          if (f && f.category && !b.catManual) b.category = f.category;
+          if (f && !b.cover && f.cover) b.cover = f.cover;
+          if (f && !b.publishedDate && f.publishedDate) b.publishedDate = f.publishedDate;
+        }
+        seriesCatCache = null; save(); scheduleRender();
+      }
+    } finally { classifying = false; }
   }
 
   // ---------- Navigation ----------
@@ -505,22 +577,12 @@
     currentView = view;
     $$('.view').forEach((v) => v.classList.toggle('active', v.id === 'view-' + view));
     $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === view));
-    $('#viewTitle').textContent = TITLES[view];
     window.scrollTo(0, 0);
     render();
-    if (view === 'releases') autoLoadReleases();
   }
-  // En ouvrant « Sorties » : si la liste n'a pas été chargée depuis 6 h (ou jamais), on la demande au serveur
-  let releasesLoading = false;
-  function autoLoadReleases() {
-    if (releasesLoading || !seriesList().length) return;
-    const fresh = state.releasesFromServer && Date.now() - (state.lastCheck || 0) < 6 * 3600e3 && state.lastCheckSeries === seriesKeySig();
-    if (fresh) return;
-    releasesLoading = true;
-    $('#lastCheck').textContent = 'Recherche des sorties de tes séries sur le serveur…';
-    loadServerReleases(false).then(() => { state.lastCheckSeries = seriesKeySig(); saveLocal(); })
-      .catch(() => { $('#lastCheck').textContent = 'Serveur indisponible : appuie sur « Chercher les nouveautés »'; })
-      .finally(() => { releasesLoading = false; if (currentView === 'releases') renderReleases(); });
+  function viewTitle() {
+    const c = CATS[curCat()];
+    return { library: 'Mes ' + c.label.toLowerCase(), series: 'Mes séries', releases: 'Sorties prévues', settings: 'Réglages' }[currentView];
   }
   // Signature des séries possédées (avec le dernier tome) : si elle change, on recalcule les sorties
   function seriesKeySig() {
@@ -528,7 +590,17 @@
   }
 
   // ---------- Rendu ----------
+  // Plusieurs mises à jour rapprochées = un seul dessin de l'écran
+  let renderPending = false;
+  function scheduleRender() {
+    if (renderPending) return;
+    renderPending = true;
+    requestAnimationFrame(() => { renderPending = false; if (!scanner.active) render(); });
+  }
   function render() {
+    seriesCatCache = null;
+    $('#viewTitle').textContent = viewTitle();
+    renderCatSwitch();
     renderSub();
     if (currentView === 'library') renderLibrary();
     if (currentView === 'series') renderSeries();
@@ -537,12 +609,12 @@
     renderBadge();
   }
   function renderSub() {
-    const n = state.books.length;
-    const s = seriesList().length;
+    const n = catBooks().length;
+    const s = seriesInCat().length;
     const sub = {
       library: n ? `${n} livre${n > 1 ? 's' : ''}` : '',
       series: s ? `${s} série${s > 1 ? 's' : ''}` : '',
-      releases: 'Les prochains tomes de tes séries',
+      releases: state.releasesRefreshing ? 'Recherche des nouveautés…' : 'Les prochains tomes de tes séries',
       settings: '',
     }[currentView];
     $('#viewSub').textContent = sub || '';
@@ -550,7 +622,7 @@
 
   function sortedBooks() {
     const q = norm($('#searchInput').value);
-    let list = state.books.filter((b) => !q || norm([b.title, b.authors, b.series, b.publisher, b.isbn].join(' ')).includes(q));
+    let list = catBooks().filter((b) => !q || norm([b.title, b.authors, b.series, b.publisher, b.isbn].join(' ')).includes(q));
     const by = state.settings.sort;
     const cmp = (a, b) => a.localeCompare(b, 'fr', { sensitivity: 'base' });
     list.sort((a, b) => {
@@ -563,17 +635,23 @@
     return list;
   }
 
+  let libSig = '';
   function renderLibrary() {
     const el = $('#libraryContent');
     $('#sortSelect').value = state.settings.sort;
     $$('.seg-btn').forEach((b) => b.classList.toggle('active', b.dataset.layout === state.settings.layout));
-    if (!state.books.length) {
-      el.innerHTML = `<div class="empty"><div class="big">📖</div><h2>Ta bibliothèque est vide</h2>
-        <p>Appuie sur le gros bouton au centre en bas pour scanner le code-barres au dos d'un livre.</p></div>`;
+    if (!catBooks().length) {
+      const c = CATS[curCat()];
+      libSig = '';
+      el.innerHTML = `<div class="empty"><div class="big">${c.icon}</div><h2>Pas encore de ${c.label.toLowerCase()}</h2>
+        <p>Appuie sur le gros bouton au centre en bas pour scanner le code-barres au dos d'un livre. Il sera rangé tout seul dans la bonne bibliothèque.</p></div>`;
       return;
     }
     const list = sortedBooks();
-    if (!list.length) { el.innerHTML = `<div class="empty"><p>Aucun livre ne correspond à ta recherche.</p></div>`; return; }
+    if (!list.length) { libSig = ''; el.innerHTML = `<div class="empty"><p>Aucun livre ne correspond à ta recherche.</p></div>`; return; }
+    const sig = [state.settings.layout, curTheme(), window.innerWidth, list.map((b) => b.id + ':' + (b.cover || '') + ':' + b.volume + ':' + (b.title || '')).join(',')].join('|');
+    if (sig === libSig && el.childElementCount) return;
+    libSig = sig;
 
     if (state.settings.layout === 'list') {
       el.innerHTML = '<div class="list">' + list.map((b) => `
@@ -584,7 +662,7 @@
         </div>`).join('') + '</div>';
     } else {
       const cols = Math.max(3, Math.floor((Math.min(window.innerWidth, 900) - 40) / 112));
-      const T = themeOf(state.settings.theme);
+      const T = themeOf(curTheme());
       let html = '<div class="shelf">' + (T.top ? `<div class="shelf-top">${T.top}</div>` : '');
       let row = 0;
       for (let i = 0; i < list.length; i += cols) {
@@ -613,9 +691,10 @@
     return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, 'fr'));
   }
 
+  function seriesInCat() { const c = curCat(); return seriesList().filter((s) => catOf(s.books[0]) === c); }
   function renderSeries() {
     const el = $('#seriesContent');
-    const list = seriesList();
+    const list = seriesInCat();
     if (!list.length) {
       el.innerHTML = `<div class="empty"><div class="big">🗂️</div><h2>Aucune série pour l'instant</h2>
         <p>Quand tu ajoutes un livre qui fait partie d'une série (ex. « One Piece – Tome 12 »), il apparaît ici automatiquement. Tu peux aussi corriger la série d'un livre en le touchant.</p></div>`;
@@ -660,17 +739,20 @@
     const el = $('#releasesContent');
     const rp = state.lastReport;
     const srcTxt = (name, x) => !x ? '' : (x.ok ? name + ' OK' : (x.err ? name + ' indisponible' + (x.last ? ' (' + x.last + ')' : '') : ''));
-    const rpTxt = rp ? ' · Sources : ' + [srcTxt('Place des Libraires', rp.pdl), srcTxt('Decitre', rp.decitre), srcTxt('Google Books', rp.google), srcTxt('BnF', rp.bnf)].filter(Boolean).join(' · ') : '';
-    const auto = state.releasesFromServer ? ' · mise à jour automatique chaque nuit' : '';
+    const rpTxt = rp ? ' · Sources : ' + [srcTxt('Leslibraires', rp.ll), srcTxt('Place des Libraires', rp.pdl), srcTxt('Decitre', rp.decitre), srcTxt('Google Books', rp.google), srcTxt('BnF', rp.bnf)].filter(Boolean).join(' · ') : '';
+    const auto = state.releasesFromServer ? ' · mise à jour automatique' : '';
     $('#lastCheck').textContent = state.lastCheck ? 'Dernière recherche : ' + new Date(state.lastCheck).toLocaleString('fr-FR', { dateStyle: 'medium', timeStyle: 'short' }) + auto + rpTxt : '';
-    if (!seriesList().length) {
+    const st = $('#relStatus');
+    if (st) st.hidden = !state.releasesRefreshing;
+    if (!seriesInCat().length) {
       el.innerHTML = `<div class="empty"><div class="big">📅</div><h2>Pas encore de série</h2><p>Ajoute des livres qui font partie d'une série, puis reviens ici : je chercherai les prochains tomes et leurs dates de sortie.</p></div>`;
       return;
     }
     // Seulement les tomes à venir, du plus proche au plus lointain (sans limite de durée)
-    const upcoming = visibleReleases().filter((r) => isUpcoming(r)).sort((a, b) => dateKey(a.date).localeCompare(dateKey(b.date)));
+    const catKeys = new Set(seriesInCat().map((x) => x.key));
+    const upcoming = visibleReleases().filter((r) => isUpcoming(r) && (catKeys.has(norm(r.series)) || (r.manual && !seriesList().some((x) => x.key === norm(r.series))))).sort((a, b) => dateKey(a.date).localeCompare(dateKey(b.date)));
     if (!upcoming.length) {
-      el.innerHTML = `<div class="empty"><p>${state.lastCheck ? 'Aucune sortie annoncée pour l’instant pour tes séries. Je revérifie chaque nuit. Tu peux aussi en ajouter une à la main si tu connais la date.' : 'Appuie sur « Chercher les nouveautés » pour trouver les prochains tomes de tes séries.'}</p></div>`;
+      el.innerHTML = `<div class="empty"><p>${state.releasesRefreshing ? 'Je cherche les prochains tomes de tes séries…' : (state.lastCheck ? 'Aucune sortie annoncée pour l’instant pour tes séries. Je revérifie à chaque ouverture de l’application et chaque nuit.' : 'Les sorties de tes séries vont apparaître ici automatiquement.')}</p></div>`;
       return;
     }
     const now = new Date(todayKey());
@@ -714,7 +796,7 @@
   }
 
   function applyTheme() {
-    document.body.dataset.theme = state.settings.theme;
+    document.body.dataset.theme = curTheme();
     const bg = getComputedStyle(document.body).getPropertyValue('--bg2').trim();
     $('meta[name="theme-color"]').setAttribute('content', bg || '#1f1712');
   }
@@ -780,6 +862,7 @@
         ${row('Parution', b.publishedDate ? fmtDate(b.publishedDate) : '')}
         ${row('Pages', b.pages ? b.pages : '')}
         ${row('ISBN', esc(b.isbn))}
+        ${row('Bibliothèque', CATS[catOf(b)].icon + ' ' + CATS[catOf(b)].label)}
         ${row('Ajouté le', b.addedAt ? new Date(b.addedAt).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' }) : '')}
       </div>
       ${b.description ? `<div class="desc">${esc(b.description)}</div>` : ''}`;
@@ -798,7 +881,10 @@
   function addBook(b) {
     Object.assign(b, { id: uid(), addedAt: Date.now() });
     delete b.incomplete;
+    if (!b.category) b.category = catOf(b);
     state.books.push(b);
+    seriesCatCache = null;
+    if (catOf(b) !== curCat()) { setCat(catOf(b)); toast('Rangé dans tes ' + CATS[catOf(b)].label.toLowerCase()); }
     save(); render();
     const missing = missingBefore(b);
     if (missing.length) askFillPrevious(b, missing);
@@ -895,7 +981,7 @@
         authors: (info && info.authors) || ref.authors || '', publisher: (info && info.publisher) || ref.publisher || '',
         publishedDate: (info && info.publishedDate) || '', pages: (info && info.pages) || null,
         description: (info && info.description) || '', cover: (info && info.cover) || '',
-        series: ref.series, volume: v,
+        series: ref.series, volume: v, category: catOf(ref),
       };
       if (info) withInfo++;
       state.books.push(nb); added.push(nb);
@@ -923,7 +1009,7 @@
     }
     save(); render();
     // Couvertures : l'une après l'autre, en arrière-plan
-    (async () => { for (const nb of added) { if (!nb.cover && nb.isbn) { const u = await findCoverAny(nb.isbn, nb.ark).catch(() => ''); nb.coverTriedAt = Date.now(); if (u) { nb.cover = u; save(); render(); } } } })();
+    (async () => { for (const nb of added) { if (!nb.cover && nb.isbn) { const u = await findCoverAny(nb.isbn, nb.ark).catch(() => ''); nb.coverTriedAt = Date.now(); if (u) { nb.cover = u; save(); scheduleRender(); } } } })();
     openSheet(`<h2>✅ ${added.length} tome${added.length > 1 ? 's' : ''} ajouté${added.length > 1 ? 's' : ''}</h2>
       <p class="muted">${esc(ref.series)} : tu as maintenant les tomes 1 à ${ref.volume}${cancelled ? ' (ajout arrêté en cours de route)' : ''}.</p>
       ${withInfo < added.length ? `<p class="muted small">${added.length - withInfo} tome${added.length - withInfo > 1 ? 's' : ''} sans fiche détaillée trouvée : ils sont ajoutés avec le nom de la série et leur numéro.</p>` : ''}
@@ -940,9 +1026,16 @@
         <button class="btn block" data-act="cover" data-id="${b.id}">🖼️ ${b.cover ? 'Changer la couverture' : 'Ajouter une couverture'}</button>
         ${b.incomplete ? `<button class="btn block" id="relookup">🔎 Relancer la recherche</button>
           <button class="btn block" data-act="edit" data-id="${b.id}">✏️ Compléter à la main</button>` : ''}
+        <button class="btn block" id="moveCat">${CATS[catOf(b) === 'manga' ? 'roman' : 'manga'].icon} Ranger dans les ${CATS[catOf(b) === 'manga' ? 'roman' : 'manga'].label.toLowerCase()}</button>
         <button class="btn danger block" data-act="delete" data-id="${b.id}">🗑️ Retirer de ma bibliothèque</button>
         <button class="btn ghost block" data-act="close">Fermer</button>
       </div>`);
+    $('#moveCat').onclick = () => {
+      const other = catOf(b) === 'manga' ? 'roman' : 'manga';
+      const same = b.series ? state.books.filter((x) => norm(x.series) === norm(b.series)) : [b];
+      moveBooks(same, other); closeSheet();
+      toast(same.length > 1 ? `${same.length} tomes rangés dans les ${CATS[other].label.toLowerCase()}` : `Rangé dans les ${CATS[other].label.toLowerCase()}`);
+    };
     const rl = $('#relookup');
     if (rl) rl.onclick = async () => {
       rl.textContent = 'Recherche…'; rl.disabled = true;
@@ -1029,7 +1122,9 @@
     const added = scanner.items.filter((i) => i.state === 'ok').length;
     const todo = scanner.items.filter((i) => i.state === 'todo').length;
     if (scanner.items.length) toast(`${added} livre${added > 1 ? 's' : ''} ajouté${added > 1 ? 's' : ''}` + (todo ? ` · ${todo} à compléter` : ''), 3500);
+    const lastOk = state.books.slice().sort((x, y) => (y.addedAt || 0) - (x.addedAt || 0))[0];
     scanner.items = []; scanner.queue = [];
+    if (added && lastOk && catOf(lastOk) !== curCat()) setCat(catOf(lastOk));
     render();
   }
 
@@ -1262,7 +1357,8 @@
       for (const b of state.books) newSnap[b.id] = bookHash(b);
       state.sync.snap = newSnap; state.sync.last = Date.now(); state.sync.error = '';
       saveLocal();
-      if (changed && !scanner.active) render();
+      if (changed) scheduleRender();
+      if (state.lastCheckSeries && state.lastCheckSeries !== seriesKeySig()) { clearTimeout(syncNow.rel); syncNow.rel = setTimeout(autoReleases, 3000); }
     } catch (e) {
       if (!state.sync) state.sync = {};
       state.sync.error = e.status === 401 ? 'code de bibliothèque refusé' : 'hors ligne';
@@ -1323,106 +1419,46 @@
   }
 
   // ---------- Sorties calculées par le serveur (chaque nuit, ou à la demande) ----------
-  async function loadServerReleases(refresh) {
-    await syncNow();
-    if (!state.sync || !state.sync.id || state.sync.error) throw new Error('serveur indisponible');
-    if (state.lastCheckSeries && state.lastCheckSeries !== seriesKeySig()) refresh = true;
-    const r = await api('releases', { id: state.sync.id, secret: state.sync.secret, refresh: !!refresh }, 150000);
-    state.lastCheckSeries = seriesKeySig();
-    if (!r) return;
+  // Le serveur répond tout de suite avec ce qu'il sait déjà, puis cherche les nouveautés en arrière-plan
+  let relPoll = null, relPolls = 0;
+  function applyReleases(r) {
     const manual = state.releases.filter((x) => x.manual);
     state.releases = manual.concat((r.releases || []).filter((f) => !manual.some((m) => relKey(m) === relKey(f))));
-    state.lastCheck = r.checked_at ? new Date(r.checked_at).getTime() : Date.now();
-    state.lastReport = r.report || null;
+    if (r.checked_at) state.lastCheck = new Date(r.checked_at).getTime();
+    state.lastReport = r.report || state.lastReport || null;
     state.releasesFromServer = true;
+    state.releasesRefreshing = !!r.refreshing;
     saveLocal();
-    if (!scanner.active) render();
+    scheduleRender();
+  }
+  async function loadServerReleases(refresh) {
+    if (!state.sync || !state.sync.id) await syncNow();
+    if (!state.sync || !state.sync.id || state.sync.error) throw new Error('serveur indisponible');
+    if (state.lastCheckSeries !== seriesKeySig()) refresh = true; // une série a changé : on recalcule
+    const r = await api('releases', { id: state.sync.id, secret: state.sync.secret, refresh: !!refresh }, 30000);
+    state.lastCheckSeries = seriesKeySig();
+    applyReleases(r);
+    clearTimeout(relPoll);
+    if (r.refreshing) { relPolls = 0; pollReleases(); }
+  }
+  function pollReleases() {
+    relPoll = setTimeout(async () => {
+      relPolls++;
+      try {
+        const r = await api('releases', { id: state.sync.id, secret: state.sync.secret, refresh: false }, 30000);
+        applyReleases(r);
+        if (r.refreshing && relPolls < 20) pollReleases();
+        else if (!r.refreshing) { state.releasesRefreshing = false; saveLocal(); scheduleRender(); }
+      } catch (e) { if (relPolls < 20) pollReleases(); }
+    }, relPolls < 3 ? 8000 : 15000);
+  }
+  // Recherche automatique : à l'ouverture, au retour dans l'application, et quand une série change
+  function autoReleases() {
+    if (!seriesList().length) return;
+    loadServerReleases(false).catch(() => { state.releasesRefreshing = false; scheduleRender(); });
   }
 
   // ---------- Recherche des sorties ----------
-  // Une série : on cherche les tomes suivants dans Google Books (dates à venir) et à la BnF (déjà parus)
-  async function releasesForSeries(s, report) {
-    const vols = s.books.map((b) => b.volume).filter(Boolean);
-    const maxOwned = vols.length ? Math.max(...vols) : 0;
-    const ownedIsbn = new Set(s.books.map((b) => b.isbn));
-    const byVol = new Map();
-    const keep = (r) => {
-      if (!r._s || norm(r._s) !== s.key || !r.volume) return;
-      delete r._s;
-      if (vols.includes(r.volume) || ownedIsbn.has(r.isbn) || r.volume < maxOwned) return;
-      const prev = byVol.get(r.volume);
-      // priorité à la date la plus précise (jour > mois > année)
-      const prec = (d) => String(d || '').split('-').length;
-      if (!prev || prec(r.date) > prec(prev.date) || (prec(r.date) === prec(prev.date) && dateKey(r.date) > dateKey(prev.date))) {
-        byVol.set(r.volume, Object.assign({ id: uid() }, prev || {}, r, { cover: r.cover || (prev && prev.cover) || '' }));
-      }
-    };
-    // Google Books
-    try {
-      const q = 'intitle:' + JSON.stringify(s.name);
-      const data = await withRetry(() => getJSON('https://www.googleapis.com/books/v1/volumes?q=' + encodeURIComponent(q) + '&orderBy=newest&maxResults=40&printType=books&country=FR', 9000), 3);
-      for (const it of data.items || []) {
-        const b = fromGoogle(it);
-        keep({ series: s.name, volume: b.volume, title: b.title, date: b.publishedDate, isbn: b.isbn, cover: b.cover, _s: b.series });
-      }
-      report.google.ok++;
-    } catch (e) { report.google.err++; report.google.last = String(e.message || e); }
-    // BnF : on demande directement les 2 tomes suivants
-    if (maxOwned) {
-      for (const v of [maxOwned + 1, maxOwned + 2]) {
-        try {
-          const recs = await withRetry(() => bnfSearch('bib.title all "' + s.name.replace(/"/g, '') + '" and bib.title all "' + v + '"', 10), 2);
-          for (const r of recs) if (r.volume === v) keep({ series: s.name, volume: r.volume, title: r.title, date: r.publishedDate, isbn: r.isbn, cover: r.cover || '', out: true, _s: r.series });
-          report.bnf.ok++;
-        } catch (e) { report.bnf.err++; report.bnf.last = String(e.message || e); }
-        await sleep(250);
-      }
-    }
-    return [...byVol.values()];
-  }
-
-  async function checkReleases() {
-    if (!seriesList().length) { toast('Ajoute d’abord des livres d’une série'); return; }
-    const btn = $('#checkReleasesBtn');
-    btn.disabled = true; btn.textContent = 'Recherche en cours…';
-    try {
-      await loadServerReleases(true);
-      btn.disabled = false; btn.textContent = '↻ Chercher les nouveautés';
-      const n = visibleReleases().length;
-      const up = visibleReleases().filter((r) => isUpcoming(r)).length;
-      toast(up ? `${up} sortie${up > 1 ? 's' : ''} à venir 🎉` : 'Aucune sortie annoncée pour l’instant');
-      return;
-    } catch (e) { /* serveur indisponible : recherche directe depuis le téléphone */ }
-    return checkReleasesLocal();
-  }
-  async function checkReleasesLocal() {
-    const series = seriesList();
-    const btn = $('#checkReleasesBtn');
-    btn.disabled = true;
-    state.releasesFromServer = false;
-    const keepManual = state.releases.filter((r) => r.manual);
-    const found = [];
-    const report = { google: { ok: 0, err: 0, last: '' }, bnf: { ok: 0, err: 0, last: '' } };
-    let i = 0;
-    for (const s of series) {
-      i++;
-      btn.textContent = `Recherche… ${i}/${series.length}`;
-      found.push(...await releasesForSeries(s, report));
-      await sleep(700); // on reste poli avec les services
-    }
-    // Une sortie trouvée seulement à la BnF est déjà parue (la BnF enregistre les livres à leur sortie)
-    for (const r of found) r.out = !!(r.out && (!r.date || r.date.length === 4));
-    state.releases = keepManual.concat(found.filter((f) => !keepManual.some((m) => relKey(m) === relKey(f))));
-    state.lastCheck = Date.now();
-    state.lastReport = report;
-    save();
-    btn.disabled = false; btn.textContent = '↻ Chercher les nouveautés';
-    render();
-    const up = visibleReleases().filter((r) => isUpcoming(r)).length;
-    const allFailed = report.google.ok === 0 && report.bnf.ok === 0;
-    if (allFailed) toast('Les catalogues ne répondent pas, réessaie dans quelques minutes', 4000);
-    else toast(up ? `${up} sortie${up > 1 ? 's' : ''} à venir trouvée${up > 1 ? 's' : ''} 🎉` : 'Recherche terminée : rien de nouveau pour l’instant');
-  }
   function isUpcoming(r) { return r.date && !r.out && dateKey(r.date) >= todayKey(); }
 
   function addReleaseManually() {
@@ -1492,11 +1528,11 @@
   function wire() {
     $$('.tab').forEach((t) => t.addEventListener('click', () => show(t.dataset.view)));
     $('#scanBtn').addEventListener('click', startScan);
-    $('#searchInput').addEventListener('input', renderLibrary);
+    let qt; $('#searchInput').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(renderLibrary, 120); });
+    $('#catSwitch').addEventListener('click', (e) => { const b = e.target.closest('[data-cat]'); if (b) setCat(b.dataset.cat); });
     $('#sortSelect').addEventListener('change', (e) => { state.settings.sort = e.target.value; save(); renderLibrary(); });
     $$('.seg-btn').forEach((b) => b.addEventListener('click', () => { state.settings.layout = b.dataset.layout; save(); renderLibrary(); }));
     $('#shelfBtn').addEventListener('click', openShelfPicker);
-    $('#checkReleasesBtn').addEventListener('click', checkReleases);
     $('#addReleaseBtn').addEventListener('click', addReleaseManually);
     $('#manualIsbnBtn').addEventListener('click', () => askIsbn());
     $('#manualBookBtn').addEventListener('click', () => {
@@ -1541,7 +1577,7 @@
     const App = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
     if (App && App.addListener) {
       App.addListener('resume', () => {
-        syncNow().then(() => { if (seriesList().length && Date.now() - (state.lastCheck || 0) > 6 * 3600e3) return loadServerReleases(false); }).catch(() => {});
+        syncNow().then(() => autoReleases()).catch(() => {});
       });
       App.addListener('backButton', () => {
         if (scanner.active || $('#scanOverlay')) finishScan();
@@ -1550,7 +1586,7 @@
         else App.exitApp && App.exitApp();
       });
     }
-    let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => currentView === 'library' && renderLibrary(), 150); });
+    let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { libSig = ''; if (currentView === 'library') renderLibrary(); }, 150); });
   }
 
   // ---------- Démarrage ----------
@@ -1558,13 +1594,12 @@
   wire();
   render();
 
-  // Couvertures manquantes
-  setTimeout(() => repairCovers().catch(() => {}), 1500);
-
-  // Synchro en ligne, puis sorties (calculées par le serveur chaque nuit)
+  // Synchro en ligne, puis sorties (recherchées automatiquement), puis rangement Romans / Mangas
   setTimeout(() => {
-    syncNow().then(() => { if (seriesList().length) return loadServerReleases(false); }).catch(() => {});
-  }, 800);
+    syncNow().then(() => { autoReleases(); return classifyLibrary(); }).catch(() => {});
+  }, 300);
+  // Couvertures manquantes, sans gêner le démarrage
+  setTimeout(() => repairCovers().catch(() => {}), 4000);
 
   // Pour les tests
   window.__biblio = { parseSeries, state: () => state };
