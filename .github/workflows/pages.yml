@@ -1,0 +1,48 @@
+name: Publier la version web (iPhone et navigateur)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      # Lecteur de codes-barres pour Safari (l'iPhone n'en a pas d'intégré au navigateur)
+      - name: Lecteur de codes-barres
+        run: |
+          mkdir -p /tmp/bc www/vendor
+          cd /tmp/bc
+          npm init -y > /dev/null
+          npm install barcode-detector@2 esbuild --no-audit --no-fund
+          echo 'import * as BD from "barcode-detector/pure"; window.WebBarcode = BD;' > entry.js
+          npx esbuild entry.js --bundle --format=iife --minify --outfile="$GITHUB_WORKSPACE/www/vendor/barcode.js"
+          find node_modules/zxing-wasm -name "zxing_reader.wasm" -exec cp {} "$GITHUB_WORKSPACE/www/vendor/" \;
+          ls -la "$GITHUB_WORKSPACE/www/vendor"
+          test -s "$GITHUB_WORKSPACE/www/vendor/barcode.js"
+          test -s "$GITHUB_WORKSPACE/www/vendor/zxing_reader.wasm"
+          touch "$GITHUB_WORKSPACE/www/.nojekyll"
+
+      # Le site est publié sur la branche gh-pages : https://<compte>.github.io/ma-bibliotheque/
+      - name: Publier
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./www
+          force_orphan: true
+          user_name: github-actions[bot]
+          user_email: github-actions[bot]@users.noreply.github.com

@@ -1071,7 +1071,9 @@
   // Scanner maison : la caméra s'affiche directement dans l'application (rapide, sans fenêtre Google)
   async function startScan() {
     const BS = getBS();
-    if (!isNative() || !BS) { askIsbn('Le scanner fonctionne dans l’application sur téléphone. Ici, tape l’ISBN (le numéro sous le code-barres) :'); return; }
+    // le son du « bip » doit être préparé pendant l'appui sur le bouton (obligatoire sur iPhone)
+    try { const A = window.AudioContext || window.webkitAudioContext; if (A) { beep.ctx = beep.ctx || new A(); beep.ctx.resume && beep.ctx.resume(); } } catch (e) { /* rien */ }
+    if (!isNative() || !BS) return startWebScan();
     if (scanner.active) return;
     closeSheet();
     scanner.lastCode = ''; scanner.items = []; scanner.queue = [];
@@ -1093,9 +1095,83 @@
     }
   }
 
+  // ---- Version web (iPhone, navigateur) : caméra du navigateur + lecteur de codes-barres
+  const loadScript = (src) => new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('chargement impossible')); document.head.appendChild(s);
+  });
+  let webDetector = null;
+  async function getWebDetector() {
+    if (webDetector) return webDetector;
+    const formats = ['ean_13', 'ean_8', 'upc_a', 'upc_e'];
+    // Chrome sur Android sait lire les codes-barres tout seul
+    if ('BarcodeDetector' in window) {
+      try {
+        const sup = await window.BarcodeDetector.getSupportedFormats();
+        if (sup.includes('ean_13')) return (webDetector = new window.BarcodeDetector({ formats }));
+      } catch (e) { /* lecteur fourni */ }
+    }
+    // Safari (iPhone) : lecteur fourni avec l'application (vendor/)
+    if (!window.WebBarcode) await loadScript('vendor/barcode.js');
+    const W = window.WebBarcode;
+    if (!W || !W.BarcodeDetector) throw new Error('lecteur indisponible');
+    const locateFile = (p, prefix) => (/\.wasm$/.test(p) ? new URL('vendor/' + p, location.href).href : (prefix || '') + p);
+    if (W.prepareZXingModule) W.prepareZXingModule({ overrides: { locateFile }, fireImmediately: true });
+    else if (W.setZXingModuleOverrides) W.setZXingModuleOverrides({ locateFile });
+    return (webDetector = new W.BarcodeDetector({ formats }));
+  }
+  function attachWebVideo(o) {
+    if (!scanner.web) return;
+    const v = document.createElement('video');
+    v.id = 'scVideo'; v.setAttribute('playsinline', ''); v.setAttribute('muted', ''); v.muted = true; v.autoplay = true;
+    v.srcObject = scanner.web.stream;
+    o.prepend(v);
+    scanner.web.video = v;
+    v.play().catch(() => {});
+  }
+  async function startWebScan() {
+    if (scanner.active) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      askIsbn('Ce navigateur ne permet pas d’utiliser la caméra. Tape l’ISBN (le numéro sous le code-barres) :'); return;
+    }
+    closeSheet();
+    scanner.lastCode = ''; scanner.items = []; scanner.queue = [];
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } } });
+    } catch (e) {
+      askIsbn('La caméra n’est pas autorisée. Sur iPhone : Réglages → Safari → Appareil photo → Autoriser, puis réessaie. En attendant, tape l’ISBN :');
+      return;
+    }
+    const track = stream.getVideoTracks()[0];
+    scanner.web = { stream, track, timer: null, video: null };
+    try { const caps = track.getCapabilities ? track.getCapabilities() : {}; scanner.torchAvail = !!caps.torch; } catch (e) { scanner.torchAvail = false; }
+    showScanOverlay();
+    scanner.active = true;
+    let det;
+    try { det = await getWebDetector(); }
+    catch (e) { await stopScan(); askIsbn('Le lecteur de codes-barres n’a pas pu se charger (vérifie ta connexion). Tape l’ISBN :'); return; }
+    const loop = async () => {
+      if (!scanner.active || !scanner.web) return;
+      const v = scanner.web.video;
+      if (v && v.readyState >= 2 && v.videoWidth) {
+        try {
+          const res = await det.detect(v);
+          if (res && res.length) onLiveCode(res.map((r) => ({ rawValue: r.rawValue })));
+        } catch (e) { /* image suivante */ }
+      }
+      if (scanner.web) scanner.web.timer = setTimeout(loop, 120);
+    };
+    loop();
+  }
+
   async function stopScan() {
     const BS = getBS();
     scanner.active = false;
+    if (scanner.web) {
+      clearTimeout(scanner.web.timer);
+      try { scanner.web.stream.getTracks().forEach((t) => t.stop()); } catch (e) { /* rien */ }
+      scanner.web = null;
+    }
     try { scanner.handle && scanner.handle.remove && (await scanner.handle.remove()); } catch (e) { /* rien */ }
     scanner.handle = null;
     try { BS && (await BS.stopScan()); } catch (e) { /* rien */ }
@@ -1122,11 +1198,18 @@
       <div class="sc-list" id="scList"></div>
       <div class="sc-bottom"><button class="sc-wide" id="scManual">Taper l’ISBN</button>${scanner.burst ? '<button class="sc-wide primary" id="scDone">Terminé</button>' : ''}</div>`;
     document.body.appendChild(o);
+    attachWebVideo(o);
     renderScanList();
     $('#scClose').onclick = () => finishScan();
     $('#scManual').onclick = async () => { await finishScan(); askIsbn(); };
     if ($('#scDone')) $('#scDone').onclick = () => finishScan();
-    $('#scTorch').onclick = async () => { try { await getBS().toggleTorch(); scanner.torch = !scanner.torch; $('#scTorch').classList.toggle('on', scanner.torch); } catch (e) { /* rien */ } };
+    $('#scTorch').onclick = async () => {
+      try {
+        if (scanner.web) await scanner.web.track.applyConstraints({ advanced: [{ torch: !scanner.torch }] });
+        else await getBS().toggleTorch();
+        scanner.torch = !scanner.torch; $('#scTorch').classList.toggle('on', scanner.torch);
+      } catch (e) { /* rien */ }
+    };
     $$('.sc-chip', o).forEach((c) => c.onclick = () => {
       scanner.burst = c.dataset.burst === '1';
       try { localStorage.setItem('mabiblio.burst', scanner.burst ? '1' : '0'); } catch (e) { /* rien */ }
@@ -1618,6 +1701,19 @@
   }, 300);
   // Couvertures manquantes, sans gêner le démarrage
   setTimeout(() => repairCovers().catch(() => {}).then(() => upgradeCovers()).catch(() => {}), 4000);
+
+  // Version web sur iPhone : explique comment la mettre sur l'écran d'accueil (une fois)
+  (() => {
+    const ios = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const standalone = window.navigator.standalone || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
+    let seen = false; try { seen = localStorage.getItem('mabiblio.a2hs') === '1'; } catch (e) { /* rien */ }
+    if (isNative() || !ios || standalone || seen) return;
+    const d = document.createElement('div');
+    d.className = 'a2hs';
+    d.innerHTML = '<span>📲 Pour l’utiliser comme une vraie appli : touche <b>Partager</b> <span class="a2hs-ic">⬆︎</span> en bas de Safari, puis <b>« Sur l’écran d’accueil »</b>.</span><button aria-label="Fermer">✕</button>';
+    d.querySelector('button').onclick = () => { d.remove(); try { localStorage.setItem('mabiblio.a2hs', '1'); } catch (e) { /* rien */ } };
+    document.body.appendChild(d);
+  })();
 
   // Pour les tests
   window.__biblio = { parseSeries, state: () => state };
