@@ -564,20 +564,27 @@
     seriesCatCache = null; save(); render();
   }
 
+  const LN_RE = /\s*\(roman\)\s*$/i;
   // Livres déjà dans la bibliothèque : on demande leur catégorie au serveur (en arrière-plan)
   let classifying = false;
   async function classifyLibrary() {
     if (classifying) return;
     classifying = true;
     try {
-      const todo = state.books.filter((b) => !b.category && b.isbn && !b.catTriedAt);
+      // livres sans catégorie, ou sans type (manga, roman, light novel…) : détection faite par le serveur
+      const todo = state.books.filter((b) => b.isbn && ((!b.category && !b.catTriedAt) || (!b.format && !b.fmtTriedAt)));
       for (let i = 0; i < todo.length; i += 6) {
         const chunk = todo.slice(i, i + 6);
         let res = {};
         try { res = (await api('lookupMany', { isbns: chunk.map((b) => b.isbn) }, 90000)).books || {}; } catch (e) { break; }
         for (const b of chunk) {
           const f = res[b.isbn];
-          b.catTriedAt = Date.now();
+          b.catTriedAt = b.fmtTriedAt = Date.now();
+          if (f && f.format) b.format = f.format;
+          // un light novel rangé avec le manga du même nom : on le met dans sa propre série « Nom (roman) »
+          if (f && f.series && LN_RE.test(f.series) && b.series && !LN_RE.test(b.series) && norm(f.series.replace(LN_RE, '')) === norm(b.series)) {
+            b.series = f.series; if (f.title) b.title = f.title;
+          }
           if (f && f.category && !b.catManual) b.category = f.category;
           if (f && !b.cover && f.cover) b.cover = f.cover;
           if (f && !b.publishedDate && f.publishedDate) b.publishedDate = f.publishedDate;
@@ -873,6 +880,7 @@
     return `<div class="detail-top"><div class="detail-cover" id="previewCover">${coverHTML(b)}</div>
       <div class="detail-meta"><h2>${esc(b.title || 'Titre inconnu')}</h2><div class="kv">${esc(b.authors || 'Auteur inconnu')}</div></div></div>
       <div class="info-box">
+        ${row('Type', esc(b.format || ''))}
         ${row('Série', esc(b.series))}
         ${row('Tome', b.volume ? 'n° ' + b.volume : '')}
         ${row('Éditeur', esc(b.publisher))}

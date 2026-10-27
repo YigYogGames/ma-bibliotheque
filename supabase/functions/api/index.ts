@@ -12,7 +12,7 @@ const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SE
   auth: { persistSession: false },
 });
 const GKEY = Deno.env.get("GOOGLE_BOOKS_KEY") || "";
-const CACHE_V = 6; // à augmenter quand la façon de lire les catalogues change
+const CACHE_V = 7; // à augmenter quand la façon de lire les catalogues change
 const clean = (b: any) => { if (!b) return b; const { _m, ...rest } = b; return rest; };
 
 const CORS = {
@@ -67,6 +67,13 @@ function parseSeries(title: string, subtitle?: string) {
   if (m && m[1].trim().length > 1) return { series: clean(m[1]), volume: +m[2] };
   return { series: "", volume: null as number | null };
 }
+
+// Light novels : même nom que le manga, donc on les range dans une série à part « Nom (roman) »
+const LN_SUFFIX = " (roman)";
+const LN_RE = /\s*\(roman\)\s*$/i;
+const baseName = (s: string) => String(s || "").replace(LN_RE, "");
+const ASIAN = ["jpn", "kor", "chi", "zho"];
+const isMangaPub = (p: string) => { const t = " " + norm(p) + " "; return MANGA_PUB.some((x) => t.includes(" " + x + " ")); };
 
 type Book = {
   isbn: string; title: string; authors: string; publisher: string; publishedDate: string;
@@ -143,6 +150,19 @@ function parseUnimarc(rec) {
     const ps = parseSeries(main, sub(t200, 'h'));
     if (ps.series) { series = ps.series; volume = ps.volume; }
   }
+  // Type de livre : la BnF dit si c'est du texte seul ou du texte + images, et classe les BD à part (805)
+  const contents = marcFields(rec, '181').flatMap((f) => f.c || []);
+  const cls = marcFields(rec, '686').map((f) => sub(f, 'a')).find(Boolean) || '';
+  const origLang = marcFields(rec, '101').flatMap((f) => f.c || [])[0] || '';
+  const drawn = /dessin|sc[ée]nario/i.test(sub(t200, 'f') + ' ' + sub(t200, 'g'));
+  const bookKind = cls === '805' || drawn ? 'manga' : /^80[0-46-9]$/.test(cls) ? 'roman'
+    : contents.includes('sti') ? 'manga' : contents.includes('txt') ? 'roman' : '';
+  const pubName = sub(marcFields(rec, '214')[0] || marcFields(rec, '210')[0], 'c');
+  const light = bookKind === 'roman' && (/light ?novel/i.test(main + ' ' + subt) || (isMangaPub(pubName) && ASIAN.includes(origLang)));
+  if (light && series && !LN_RE.test(series)) {
+    const old = series; series = series + LN_SUFFIX;
+    if (title.startsWith(old)) title = series + title.slice(old.length);
+  }
   const authors = marcFields(rec, '700').concat(marcFields(rec, '701'))
     .map((f) => (sub(f, 'b') + ' ' + sub(f, 'a')).trim()).filter(Boolean);
   const pubF = marcFields(rec, '214')[0] || marcFields(rec, '210')[0];
@@ -157,7 +177,7 @@ function parseUnimarc(rec) {
     isbn: /^97[89]\d{10}$/.test(isbn) ? isbn : '', title, authors: [...new Set(authors)].join(', '),
     publisher: sub(pubF, 'c'), publishedDate: year, pages, description: sub(marcFields(rec, '330')[0], 'a'),
     cover: hasCover && ark ? 'https://catalogue.bnf.fr/couverture?&appName=NE&idArk=' + ark + '&couverture=1' : '',
-    series, volume, ark, subjects, collection: colls.join(', '),
+    series, volume, ark, subjects, collection: colls.join(', '), kind: bookKind, light, origLang,
     // indices pour reconnaître la même édition (format, prix, collection) et écarter les produits dérivés
     _m: { main: norm(main), sub: norm(subt), colls, price, size },
   };
@@ -170,7 +190,7 @@ function pubWord(p) {
 }
 // Recherche BnF d'un tome précis : d'abord chez le même éditeur, sinon partout
 async function bnfVolumeSearch(series, v, publisher) {
-  const base = 'bib.title all "' + String(series).replace(/"/g, '') + '" and bib.title all "' + v + '"';
+  const base = 'bib.title all "' + baseName(series).replace(/"/g, '') + '" and bib.title all "' + v + '"';
   const pw = pubWord(publisher);
   let recs = pw ? await bnfSearch(base + ' and bib.publisher all "' + pw + '"', 50) : [];
   if (!recs.some((r) => r.volume === v && norm(r.series) === norm(series))) recs = recs.concat(await bnfSearch(base, 50));
@@ -374,7 +394,10 @@ async function srcLeslibraires(isbn: string) {
   let cover = g(/<img[^>]*itemprop="image"[^>]*src="([^"]+)"/);
   if (cover.startsWith("//")) cover = "https:" + cover;
   const collection = strip(row("Collection"));
+  const lo = norm(strip(row("Langue d'origine")));
+  const origLang = /coreen/.test(lo) ? "kor" : /japonais/.test(lo) ? "jpn" : /chinois/.test(lo) ? "chi" : "";
   return {
+    origLang,
     isbn, series, volume,
     title: series && volume ? series + " – Tome " + volume + (part ? " – " + part : "") : h1,
     authors: authors.join(", "), publisher: strip(row("Éditeur")),
@@ -421,7 +444,8 @@ async function srcDecitre(isbn: string) {
 const MANGA_PUB = ["pika", "kana", "ki oon", "kioon", "kurokawa", "tonkam", "kaze", "doki doki", "akata", "soleil manga", "crunchyroll",
   "noeve", "mangetsu", "meian", "glenat manga", "panini manga", "black box", "ototo", "taifu", "nobi nobi", "kbooks", "sakka", "naban",
   "isan manga", "omake", "lezard noir", "imho", "vega", "dupuis manga", "kotoji", "hikari", "komikku", "mana books", "h2t", "shiba",
-  "bamboo manga", "michel lafon manga", "nazca", "delcourt tonkam", "ankama", "casterman sakka", "fleurus manga", "rue de sevres manga"];
+  "bamboo manga", "michel lafon manga", "nazca", "delcourt tonkam", "ankama", "casterman sakka", "fleurus manga", "rue de sevres manga",
+  "ofelbe", "lanovel"];
 function categorize(parts: any[]): string {
   const txt = " " + norm(parts.flat().filter(Boolean).join(" ")) + " ";
   if (/ (mangas?|shonen|shounen|seinen|shojo|shoujo|josei|kodomo|webtoons?|manhwa|manhua|bandes? dessinees?|bd|comics?|graphic novels?|comic books?) /.test(txt)) return "manga";
@@ -483,7 +507,22 @@ async function lookup(isbn: string) {
     description: first(ll?.description, bnf?.description, gg?.description, pdl?.description, pickAll("description")),
     series, volume, ark: bnf?.ark || "", collection: first(ll?.collection, pdl?.collection, bnf?.collection),
   };
-  b.category = categorize([found.map((f: any) => [f.subjects, f.collection]), b.publisher, b.collection]);
+  // Type de livre, du plus sûr au moins sûr : la notice BnF, le mot « roman » / « light novel » dans un titre, puis rayon et éditeur
+  // (les rayons des libraires sont parfois faux : Leslibraires range le roman Solo Leveling en BD)
+  const titlesTxt = " " + norm(found.map((f: any) => f.title).join(" ")) + " ";
+  const saysNovel = / (light novel|novel|roman) /.test(titlesTxt);
+  const kind = bnf?.kind || (saysNovel ? "roman" : "");
+  b.category = kind || categorize([found.map((f: any) => [f.subjects, f.collection]), b.publisher, b.collection]);
+  const origLang = bnf?.origLang || ll?.origLang || "";
+  const light = b.category === "roman" && (bnf?.light || / light novel /.test(titlesTxt + norm(b.collection) + " ") ||
+    (isMangaPub(b.publisher) && (saysNovel || ASIAN.includes(origLang))));
+  if (light && b.series && !LN_RE.test(b.series)) {
+    b.series = baseName(b.series) + LN_SUFFIX;
+    if (b.volume) b.title = b.series + " – Tome " + b.volume;
+  }
+  b.format = light ? "Light novel" : b.category === "roman" ? "Roman"
+    : origLang === "kor" ? "Manhwa" : (ASIAN.includes(origLang) || isMangaPub(b.publisher)) ? "Manga"
+    : / comics? /.test(" " + norm(JSON.stringify(found.map((f: any) => f.subjects || []))) + " ") ? "Comics" : "BD";
   // couverture : Amazon d'abord, puis Leslibraires, Decitre, BnF et les autres (chaque image est vérifiée)
   b.cover = await amazonPick(isbn, { title: b.title, series: b.series, volume: b.volume }, amzCands).catch(() => "");
   if (!b.cover) {
@@ -516,7 +555,7 @@ async function googleSeriesIndex(series: string) {
   const map = new Map<number, Book>();
   for (const start of [0, 40]) {
     try {
-      const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent("intitle:" + JSON.stringify(series)) + "&maxResults=40&startIndex=" + start + "&printType=books")), 2);
+      const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent("intitle:" + JSON.stringify(baseName(series)) + (LN_RE.test(series) ? " roman" : "")) + "&maxResults=40&startIndex=" + start + "&printType=books")), 2);
       for (const it of d.items || []) {
         const b = fromGoogle(it);
         if (b.volume && norm(b.series) === norm(series) && b.isbn && !map.has(b.volume)) map.set(b.volume, b);
@@ -639,6 +678,7 @@ async function releasesForSeries(name: string, books: any[], report: any) {
     const prev = byVol.get(r.volume);
     const prec = (d: string) => String(d || "").split("-").length;
     const special = (t: string) => /collector|coffret|edition speciale|edition limitee|limited|integrale|pack /.test(norm(t));
+    if (!LN_RE.test(name) && / duo | roman t(ome)? ?\d/.test(" " + norm(r.title) + " ")) return; // lot « manga + roman » : pas un vrai tome
     const better = !prev || (special(prev.title) && !special(r.title)) || (special(prev.title) === special(r.title) && prec(r.date) > prec(prev.date));
     if (better) byVol.set(r.volume, { ...(prev || {}), ...r, cover: r.cover || prev?.cover || "", sources: [...new Set([...(prev?.sources || []), r.src])] });
     else if (!special(r.title)) prev.sources = [...new Set([...(prev.sources || []), r.src])];
@@ -674,24 +714,26 @@ async function releasesForSeries(name: string, books: any[], report: any) {
     catch (e) { report[rk].err++; report[rk].last = String((e as Error)?.message || e); }
   })());
   // Place des Libraires : les numéros l'un après l'autre (le site n'aime pas les demandes simultanées)
+  // pour un light novel « Nom (roman) », on cherche « Nom roman »
+  const qName = name.replace(LN_RE, " roman");
   run("Place des Libraires", async () => {
     const all: any[] = [];
     let ok = 0;
-    for (const v of next) { try { all.push(...await pdlSearch(name + " " + v)); ok++; } catch (e) { pdlPartial = true; if (!ok && v === next[next.length - 1]) throw e; } }
+    for (const v of next) { try { all.push(...await pdlSearch(qName + " " + v)); ok++; } catch (e) { pdlPartial = true; if (!ok && v === next[next.length - 1]) throw e; } }
     return all;
   });
   for (const v of next) {
     run("Google Books", async () => {
-      const q = "intitle:" + JSON.stringify(name) + " " + v;
+      const q = "intitle:" + JSON.stringify(baseName(name)) + (LN_RE.test(name) ? " roman" : "") + " " + v;
       const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent(q) + "&maxResults=20&printType=books&langRestrict=fr")), 3);
       return (d.items || []).map((it: any) => { const b = fromGoogle(it); return { ...b, date: b.publishedDate, src: "Google Books" }; });
     });
   }
   // Decitre : une recherche sur le nom de la série suffit (elle liste les livres à paraître)
-  run("Decitre", () => decitre(name));
+  run("Decitre", () => decitre(qName));
   // Google : les nouveautés les plus récentes de la série
   run("Google Books", async () => {
-    const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent("intitle:" + JSON.stringify(name)) + "&orderBy=newest&maxResults=40&printType=books&langRestrict=fr")), 2);
+    const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent("intitle:" + JSON.stringify(baseName(name)) + (LN_RE.test(name) ? " roman" : "")) + "&orderBy=newest&maxResults=40&printType=books&langRestrict=fr")), 2);
     return (d.items || []).map((it: any) => { const b = fromGoogle(it); return { ...b, date: b.publishedDate, src: "Google Books" }; });
   });
   await Promise.all(tasks);
