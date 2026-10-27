@@ -25,20 +25,14 @@
     <!-- BIBLIOTHÈQUE -->
     <section class="view active" id="view-library">
       <div class="toolbar">
-        <input type="search" id="searchInput" placeholder="Rechercher un titre, un auteur, une série…" autocomplete="off">
         <div class="toolbar-row">
-          <select id="sortSelect" aria-label="Trier">
-            <option value="added">Ajout récent</option>
-            <option value="title">Titre (A→Z)</option>
-            <option value="author">Auteur (A→Z)</option>
-            <option value="series">Série puis tome</option>
-            <option value="date">Date de parution</option>
-          </select>
-          <div class="seg" role="group" aria-label="Affichage">
-            <button class="seg-btn active" data-layout="shelf" title="Étagères">▥</button>
-            <button class="seg-btn" data-layout="list" title="Liste">☰</button>
-          </div>
-          <button class="shelf-btn" id="shelfBtn" title="Changer d'étagère" aria-label="Changer d'étagère">🎨</button>
+          <input type="search" id="searchInput" placeholder="Rechercher un titre, un auteur, une série…" autocomplete="off" aria-label="Rechercher">
+          <button class="tool-btn" id="sortBtn" title="Trier" aria-label="Trier">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4v16M3.5 16.5 7 20l3.5-3.5M17 20V4M13.5 7.5 17 4l3.5 3.5"/></svg>
+          </button>
+          <button class="tool-btn" id="layoutBtn" title="Disposition des étagères" aria-label="Disposition des étagères">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+          </button>
         </div>
       </div>
       <div id="libraryContent"></div>
@@ -63,7 +57,7 @@
     <section class="view" id="view-settings">
       <div class="card">
         <h3>Étagère et décor</h3>
-        <p class="muted small">Choisis l'ambiance de ta bibliothèque. Tu peux aussi changer d'étagère avec le bouton 🎨 de l'écran Livres.</p>
+        <p class="muted small">Choisis l'ambiance de ta bibliothèque. Tu peux aussi changer d'étagère avec l'engrenage de l'écran Livres (Disposition → Changer de décor).</p>
         <div class="themes" id="themePicker"></div>
       </div>
       <div class="card">
@@ -95,7 +89,7 @@
       </div>
       <div class="card">
         <h3>À propos</h3>
-        <p class="muted small" id="aboutText">Ma Bibliothèque — version 0.9. Couvertures : Amazon en priorité, puis Decitre, Leslibraires et la BnF.</p>
+        <p class="muted small" id="aboutText">Ma Bibliothèque — version 0.10. Couvertures : Amazon en priorité, puis Decitre, Leslibraires et la BnF.</p>
       </div>
     </section>
   </main>

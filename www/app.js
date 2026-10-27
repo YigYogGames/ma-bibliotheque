@@ -659,11 +659,127 @@
     return list;
   }
 
+  // ---------- Dispositions des étagères ----------
+  const LAYOUTS = [
+    { id: 'shelf', name: 'Classique', desc: 'Tous les livres à la suite, dans l’ordre de tri choisi.' },
+    { id: 'series', name: 'Une série par étagère', desc: 'Chaque étagère = une série. Glisse de gauche à droite pour voir les tomes.' },
+    { id: 'group', name: 'Séries regroupées', desc: 'Une seule couverture par série. Touche-la pour déplier tous ses tomes.' },
+    { id: 'list', name: 'Liste', desc: 'Une ligne par livre, avec le titre et l’auteur.' },
+  ];
+  const SORTS = [
+    { id: 'added', name: 'Ajout récent' },
+    { id: 'series', name: 'Série puis tome' },
+    { id: 'title', name: 'Titre (A→Z)' },
+    { id: 'author', name: 'Auteur (A→Z)' },
+    { id: 'date', name: 'Date de parution' },
+  ];
+  const LAYOUT_ICON = {
+    shelf: '<i class="li-row"><b></b><b></b><b></b><b></b><b></b></i><i class="li-plank"></i><i class="li-row"><b></b><b></b><b></b><b></b><b></b></i><i class="li-plank"></i>',
+    series: '<i class="li-row li-scroll"><b></b><b></b><b></b><b></b><b></b><b></b><b></b></i><i class="li-plank"></i><i class="li-row li-scroll alt"><b></b><b></b><b></b><b></b><b></b><b></b><b></b></i><i class="li-plank"></i>',
+    group: '<i class="li-row li-piles"><b></b><b></b><b></b></i><i class="li-plank"></i>',
+    list: '<i class="li-line"></i><i class="li-line"></i><i class="li-line"></i><i class="li-line"></i>',
+  };
+  function optionCards(items, current, attr, icons) {
+    return items.map((o) => `<button class="opt-card ${o.id === current ? 'on' : ''}" ${attr}="${o.id}">
+        ${icons ? `<span class="opt-icon" aria-hidden="true">${icons[o.id]}</span>` : ''}
+        <span class="opt-main"><span class="opt-name">${o.name}</span>${o.desc ? `<span class="opt-desc">${o.desc}</span>` : ''}</span>
+        <span class="opt-radio" aria-hidden="true"></span></button>`).join('');
+  }
+  function openLayoutMenu() {
+    openSheet(`<h2>Disposition des étagères</h2><p class="muted small">Choisis comment tes livres sont rangés.</p>
+      <div class="opt-list">${optionCards(LAYOUTS, state.settings.layout, 'data-layout', LAYOUT_ICON)}</div>
+      <div class="sheet-actions"><button class="btn block" id="decorBtn">🎨 Changer de décor</button>
+      <button class="btn ghost block" data-act="close">Fermer</button></div>`);
+    $$('[data-layout]', $('#sheetBody')).forEach((b) => b.onclick = () => {
+      state.settings.layout = b.dataset.layout; openPile = null; save(); closeSheet(); renderLibrary();
+      window.scrollTo({ top: 0 });
+    });
+    $('#decorBtn').onclick = openShelfPicker;
+  }
+  function openSortMenu() {
+    openSheet(`<h2>Trier les livres</h2>
+      <div class="opt-list">${optionCards(SORTS, state.settings.sort, 'data-sort')}</div>
+      <div class="sheet-actions"><button class="btn ghost block" data-act="close">Fermer</button></div>`);
+    $$('[data-sort]', $('#sheetBody')).forEach((b) => b.onclick = () => {
+      state.settings.sort = b.dataset.sort; save(); closeSheet(); renderLibrary();
+    });
+  }
+  // Regroupe les livres (déjà triés) par série, dans l'ordre où chaque série apparaît ; tomes du plus petit au plus grand
+  function groupBySeries(list) {
+    const groups = [], idx = new Map(), loose = [];
+    for (const b of list) {
+      if (!b.series) { loose.push(b); continue; }
+      const k = norm(b.series);
+      if (!idx.has(k)) { idx.set(k, groups.length); groups.push({ key: k, name: b.series, books: [] }); }
+      groups[idx.get(k)].books.push(b);
+    }
+    for (const g of groups) g.books.sort((a, b) => (a.volume || 0) - (b.volume || 0));
+    return { groups, loose };
+  }
+  const bookHTML = (b) => `<div class="book" data-id="${b.id}">${coverHTML(b)}${b.volume ? `<span class="vol-tag">${b.volume}</span>` : ''}</div>`;
+  function plankHTML(row) {
+    const T = themeOf(curTheme());
+    const hang = T.hang.length ? `<span class="hang ${row % 2 ? 'r' : 'l'}">${T.hang[row % T.hang.length]}</span>` : '';
+    return `<div class="shelf-plank">${hang}${T.lights ? '<span class="lights"></span>' : ''}</div>`;
+  }
+  function shelfCols() { return Math.max(3, Math.floor((Math.min(window.innerWidth, 900) - 40) / 112)); }
+
+  // Mode « une série par étagère » : chaque étagère défile de gauche à droite
+  function seriesShelvesHTML(list) {
+    const { groups, loose } = groupBySeries(list);
+    const T = themeOf(curTheme());
+    const shelves = groups.map((g) => ({ name: g.name, books: g.books, count: g.books.length + ' tome' + (g.books.length > 1 ? 's' : '') }));
+    if (loose.length) shelves.push({ name: 'Autres livres', books: loose, count: loose.length + ' livre' + (loose.length > 1 ? 's' : '') });
+    return '<div class="shelf">' + (T.top ? `<div class="shelf-top">${T.top}</div>` : '') + shelves.map((s, i) => `
+      <section class="series-shelf">
+        <div class="series-head"><b>${esc(s.name)}</b><span>${s.count}${s.books.length > 3 ? ' · glisse →' : ''}</span></div>
+        <div class="series-scroll">${s.books.map(bookHTML).join('')}</div>
+        ${plankHTML(i)}
+      </section>`).join('') + '</div>';
+  }
+
+  // Mode « séries regroupées » : une pile par série, qui se déplie quand on la touche
+  let openPile = null;
+  function groupedShelvesHTML(list) {
+    const { groups, loose } = groupBySeries(list);
+    const T = themeOf(curTheme());
+    const cols = shelfCols();
+    const units = [];
+    const seen = new Set();
+    for (const b of list) { // garde l'ordre du tri : une série prend la place de son premier tome
+      if (!b.series) { units.push({ book: b }); continue; }
+      const k = norm(b.series);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      const g = groups.find((x) => x.key === k);
+      units.push(g.books.length > 1 ? { group: g } : { book: g.books[0] });
+    }
+    void loose;
+    let html = '<div class="shelf">' + (T.top ? `<div class="shelf-top">${T.top}</div>` : '');
+    for (let i = 0, row = 0; i < units.length; i += cols, row++) {
+      const chunk = units.slice(i, i + cols);
+      html += `<div class="shelf-row" style="--cols:${cols}">` + chunk.map((u) => {
+        if (u.book) return bookHTML(u.book);
+        const g = u.group, first = g.books[0];
+        return `<button class="book pile ${openPile === g.key ? 'open' : ''}" data-pile="${esc(g.key)}" aria-label="${esc(g.name)}, ${g.books.length} tomes">${coverHTML(Object.assign({}, first, { id: '', title: g.name }))}<span class="pile-count">${g.books.length} tomes</span></button>`;
+      }).join('') + `</div>${plankHTML(row)}`;
+      const opened = chunk.find((u) => u.group && u.group.key === openPile);
+      if (opened) {
+        const g = opened.group;
+        html += `<div class="pile-panel"><div class="pile-head"><b>${esc(g.name)}</b><span>${g.books.length} tomes</span>
+          <button class="btn small" data-regroup>Regrouper</button></div>`;
+        for (let k = 0; k < g.books.length; k += cols) {
+          html += `<div class="shelf-row" style="--cols:${cols}">` + g.books.slice(k, k + cols).map(bookHTML).join('') + `</div><div class="shelf-plank thin"></div>`;
+        }
+        html += '</div>';
+      }
+    }
+    return html + '</div>';
+  }
+
   let libSig = '';
   function renderLibrary() {
     const el = $('#libraryContent');
-    $('#sortSelect').value = state.settings.sort;
-    $$('.seg-btn').forEach((b) => b.classList.toggle('active', b.dataset.layout === state.settings.layout));
     if (!catBooks().length) {
       const c = CATS[curCat()];
       libSig = '';
@@ -673,11 +789,13 @@
     }
     const list = sortedBooks();
     if (!list.length) { libSig = ''; el.innerHTML = `<div class="empty"><p>Aucun livre ne correspond à ta recherche.</p></div>`; return; }
-    const sig = [state.settings.layout, curTheme(), window.innerWidth, list.map((b) => b.id + ':' + (b.cover || '') + ':' + b.volume + ':' + (b.title || '')).join(',')].join('|');
+    const layout = state.settings.layout;
+    const sig = [layout, openPile, curTheme(), window.innerWidth, list.map((b) => b.id + ':' + (b.cover || '') + ':' + b.volume + ':' + (b.title || '')).join(',')].join('|');
     if (sig === libSig && el.childElementCount) return;
     libSig = sig;
 
-    if (state.settings.layout === 'list') {
+    if (layout === 'series' || layout === 'group') { el.innerHTML = layout === 'series' ? seriesShelvesHTML(list) : groupedShelvesHTML(list); return; }
+    if (layout === 'list') {
       el.innerHTML = '<div class="list">' + list.map((b) => `
         <div class="list-item" data-id="${b.id}">
           <div class="thumb">${coverHTML(b)}</div>
@@ -1639,9 +1757,8 @@
     $('#scanBtn').addEventListener('click', startScan);
     let qt; $('#searchInput').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(renderLibrary, 120); });
     $('#catSwitch').addEventListener('click', (e) => { const b = e.target.closest('[data-cat]'); if (b) setCat(b.dataset.cat); });
-    $('#sortSelect').addEventListener('change', (e) => { state.settings.sort = e.target.value; save(); renderLibrary(); });
-    $$('.seg-btn').forEach((b) => b.addEventListener('click', () => { state.settings.layout = b.dataset.layout; save(); renderLibrary(); }));
-    $('#shelfBtn').addEventListener('click', openShelfPicker);
+    $('#sortBtn').addEventListener('click', openSortMenu);
+    $('#layoutBtn').addEventListener('click', openLayoutMenu);
     $('#addReleaseBtn').addEventListener('click', addReleaseManually);
     $('#manualIsbnBtn').addEventListener('click', () => askIsbn());
     $('#manualBookBtn').addEventListener('click', () => {
@@ -1655,7 +1772,13 @@
     $('#importBtn').addEventListener('click', () => $('#importFile').click());
     $('#importFile').addEventListener('change', (e) => { if (e.target.files[0]) importData(e.target.files[0]); e.target.value = ''; });
 
-    $('#libraryContent').addEventListener('click', (e) => { const it = e.target.closest('[data-id]'); if (it) openBook(it.dataset.id); });
+    $('#libraryContent').addEventListener('click', (e) => {
+      const pile = e.target.closest('[data-pile]');
+      if (pile) { openPile = openPile === pile.dataset.pile ? null : pile.dataset.pile; renderLibrary(); return; }
+      if (e.target.closest('[data-regroup]')) { openPile = null; renderLibrary(); return; }
+      const it = e.target.closest('.book[data-id], .list-item[data-id]');
+      if (it && it.dataset.id) openBook(it.dataset.id);
+    });
     $('#releasesContent').addEventListener('click', (e) => {
       const x = e.target.closest('[data-dismiss]');
       if (!x) return;
