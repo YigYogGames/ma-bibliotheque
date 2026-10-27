@@ -374,6 +374,7 @@
       if (!u) return;
       b.cover = u; b.coverTriedAt = Date.now();
       const pv = $('#previewCover'); if (pv) pv.innerHTML = coverHTML(b);
+      const bd = $('.book-card'); if (bd && !$('.bc-backdrop', bd)) bd.insertAdjacentHTML('afterbegin', `<div class="bc-backdrop" aria-hidden="true"><img src="${esc(u)}" alt=""></div>`);
       if (state.books.includes(b)) { save(); scheduleRender(); }
     }).catch(() => {});
   }
@@ -993,23 +994,38 @@
   }
 
   // Zone d'informations en lecture seule
+  // Fiche « douce » : couverture floutée en fond, grande couverture, pastilles, petites cases d'infos, résumé repliable
   function bookCard(b) {
-    const row = (k, v) => v ? `<div class="info-row"><span class="info-k">${k}</span><span class="info-v">${v}</span></div>` : '';
-    return `<div class="detail-top"><div class="detail-cover" id="previewCover">${coverHTML(b)}</div>
-      <div class="detail-meta"><h2>${esc(b.title || 'Titre inconnu')}</h2><div class="kv">${esc(b.authors || 'Auteur inconnu')}</div></div></div>
-      <div class="info-box">
-        ${row('Type', esc(b.format || ''))}
-        ${row('Série', esc(b.series))}
-        ${row('Tome', b.volume ? 'n° ' + b.volume : '')}
-        ${row('Éditeur', esc(b.publisher))}
-        ${row('Parution', b.publishedDate ? fmtDate(b.publishedDate) : '')}
-        ${row('Pages', b.pages ? b.pages : '')}
-        ${row('ISBN', esc(b.isbn))}
-        ${row('Bibliothèque', CATS[catOf(b)].icon + ' ' + CATS[catOf(b)].label)}
-        ${row('Ajouté le', b.addedAt ? new Date(b.addedAt).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' }) : '')}
+    const hasSeries = b.series && b.volume;
+    // « Série – Tome 3 – Sous-titre » : on garde le sous-titre à part
+    const part = hasSeries ? String(b.title || '').split(/\s[–-]\s*Tome\s*\d+\s*[–-]\s*/i)[1] || '' : '';
+    const name = hasSeries ? b.series : (b.title || 'Titre inconnu');
+    const chips = [b.format, b.pages ? b.pages + ' pages' : '', CATS[catOf(b)].label].filter(Boolean);
+    const added = b.addedAt ? new Date(b.addedAt).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+    const tile = (k, v) => v ? `<div class="bc-tile"><span>${k}</span><b>${v}</b></div>` : '';
+    const tiles = [tile('Éditeur', esc(b.publisher)), tile('Parution', b.publishedDate ? fmtDate(b.publishedDate) : ''),
+      tile('Dans ta bibliothèque', added ? 'depuis le ' + added : ''), tile('ISBN', esc(b.isbn))].filter(Boolean).join('');
+    const long = (b.description || '').length > 220;
+    return `<div class="book-card">
+      ${b.cover ? `<div class="bc-backdrop" aria-hidden="true"><img src="${esc(b.cover)}" alt=""></div>` : ''}
+      <div class="bc-head">
+        <div class="bc-cover" id="previewCover">${coverHTML(b)}</div>
+        <h2 class="bc-title">${esc(name)}</h2>
+        ${hasSeries ? `<div class="bc-vol">Tome ${b.volume}${part ? ' · ' + esc(part) : ''}</div>` : ''}
+        <div class="bc-authors">${esc(b.authors || 'Auteur inconnu')}</div>
+        ${chips.length ? `<div class="bc-chips">${chips.map((c) => `<span>${esc(c)}</span>`).join('')}</div>` : ''}
       </div>
-      ${b.description ? `<div class="desc">${esc(b.description)}</div>` : ''}`;
+      ${tiles ? `<div class="bc-tiles">${tiles}</div>` : ''}
+      ${b.description ? `<div class="bc-summary"><h3>Résumé</h3><p class="${long ? 'clamp' : ''}">${esc(b.description)}</p>
+        ${long ? `<button class="bc-more" onclick="const p=this.previousElementSibling;p.classList.toggle('clamp');this.textContent=p.classList.contains('clamp')?'Lire la suite':'Réduire'">Lire la suite</button>` : ''}</div>` : ''}
+    </div>`;
   }
+  // Icônes des boutons de la fiche
+  const ICON = {
+    cover: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2"/><circle cx="9.5" cy="9" r="1.6"/><path d="m20 16-4.5-4.5L7 20"/></svg>',
+    move: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5.5c3-1.5 6-1.5 9 .5 3-2 6-2 9-.5V19c-3-1.5-6-1.5-9 .5-3-2-6-2-9-.5z"/><path d="M12 6v13.5"/></svg>',
+    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>',
+  };
 
   function confirmAdd(b) {
     openSheet(`${bookCard(b)}
@@ -1164,15 +1180,16 @@
   function openBook(id) {
     const b = state.books.find((x) => x.id === id);
     if (!b) return;
+    const otherCat = CATS[catOf(b) === 'manga' ? 'roman' : 'manga'];
     openSheet(`${bookCard(b)}
-      <div class="sheet-actions">
-        <button class="btn block" data-act="cover" data-id="${b.id}">🖼️ ${b.cover ? 'Changer la couverture' : 'Ajouter une couverture'}</button>
-        ${b.incomplete ? `<button class="btn block" id="relookup">🔎 Relancer la recherche</button>
-          <button class="btn block" data-act="edit" data-id="${b.id}">✏️ Compléter à la main</button>` : ''}
-        <button class="btn block" id="moveCat">${CATS[catOf(b) === 'manga' ? 'roman' : 'manga'].icon} Ranger dans les ${CATS[catOf(b) === 'manga' ? 'roman' : 'manga'].label.toLowerCase()}</button>
-        <button class="btn danger block" data-act="delete" data-id="${b.id}">🗑️ Retirer de ma bibliothèque</button>
-        <button class="btn ghost block" data-act="close">Fermer</button>
-      </div>`);
+      ${b.incomplete ? `<div class="sheet-actions"><button class="btn block" id="relookup">🔎 Relancer la recherche</button>
+          <button class="btn block" data-act="edit" data-id="${b.id}">✏️ Compléter à la main</button></div>` : ''}
+      <div class="bc-actions">
+        <button class="bc-act" data-act="cover" data-id="${b.id}">${ICON.cover}<span>Couverture</span></button>
+        <button class="bc-act" id="moveCat">${ICON.move}<span>Vers les ${otherCat.label.toLowerCase()}</span></button>
+        <button class="bc-act danger" data-act="delete" data-id="${b.id}">${ICON.trash}<span>Retirer</span></button>
+      </div>
+      <button class="btn ghost block bc-close" data-act="close">Fermer</button>`);
     $('#moveCat').onclick = () => {
       const other = catOf(b) === 'manga' ? 'roman' : 'manga';
       const same = b.series ? state.books.filter((x) => norm(x.series) === norm(b.series)) : [b];
