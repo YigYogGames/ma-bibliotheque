@@ -554,11 +554,11 @@
   }
   function renderCatSwitch() {
     const el = $('#catSwitch'); if (!el) return;
-    el.hidden = currentView === 'settings';
+    el.hidden = currentView === 'settings' || currentView === 'stats';
     const c = curCat();
     const counts = { roman: 0, manga: 0 };
     for (const b of state.books) counts[catOf(b)]++;
-    el.innerHTML = Object.entries(CATS).map(([k, v]) => `<button class="cat-btn ${k === c ? 'on' : ''}" data-cat="${k}"><span>${v.icon}</span>${v.label}<span class="cat-n">${counts[k]}</span></button>`).join('');
+    el.innerHTML = Object.entries(CATS).map(([k, v]) => `<button class="cat-btn ${k === c ? 'on' : ''}" data-cat="${k}">${v.label}<span class="cat-n">${counts[k]}</span></button>`).join('');
   }
   function moveBooks(books, cat) {
     for (const b of books) { b.category = cat; b.catManual = true; }
@@ -573,15 +573,16 @@
     classifying = true;
     try {
       // livres sans catégorie, ou sans type (manga, roman, light novel…) : détection faite par le serveur
-      const todo = state.books.filter((b) => b.isbn && ((!b.category && !b.catTriedAt) || (!b.format && !b.fmtTriedAt)));
+      const todo = state.books.filter((b) => b.isbn && ((!b.category && !b.catTriedAt) || (!b.format && !b.fmtTriedAt) || (b.price == null && !b.priceTriedAt)));
       for (let i = 0; i < todo.length; i += 6) {
         const chunk = todo.slice(i, i + 6);
         let res = {};
         try { res = (await api('lookupMany', { isbns: chunk.map((b) => b.isbn) }, 90000)).books || {}; } catch (e) { break; }
         for (const b of chunk) {
           const f = res[b.isbn];
-          b.catTriedAt = b.fmtTriedAt = Date.now();
+          b.catTriedAt = b.fmtTriedAt = b.priceTriedAt = Date.now();
           if (f && f.format) b.format = f.format;
+          if (f && f.price && !b.price) b.price = f.price;
           // un light novel rangé avec le manga du même nom : on le met dans sa propre série « Nom (roman) »
           if (f && f.series && LN_RE.test(f.series) && b.series && !LN_RE.test(b.series) && norm(f.series.replace(LN_RE, '')) === norm(b.series)) {
             b.series = f.series; if (f.title) b.title = f.title;
@@ -607,7 +608,7 @@
   }
   function viewTitle() {
     const c = CATS[curCat()];
-    return { library: 'Mes ' + c.label.toLowerCase(), series: 'Mes séries', releases: 'Sorties prévues', settings: 'Réglages' }[currentView];
+    return { library: 'Ma bibliothèque', series: 'Mes séries', stats: 'Statistiques', releases: 'Sorties prévues', settings: 'Réglages' }[currentView];
   }
   // Signature des séries possédées (avec le dernier tome) : si elle change, on recalcule les sorties
   function seriesKeySig() {
@@ -629,6 +630,7 @@
     renderSub();
     if (currentView === 'library') renderLibrary();
     if (currentView === 'series') renderSeries();
+    if (currentView === 'stats') renderStats();
     if (currentView === 'releases') renderReleases();
     if (currentView === 'settings') renderSettings();
     renderBadge();
@@ -637,7 +639,8 @@
     const n = catBooks().length;
     const s = seriesInCat().length;
     const sub = {
-      library: n ? `${n} livre${n > 1 ? 's' : ''}` : '',
+      library: n ? `${n} ${CATS[curCat()].label.toLowerCase()}` : '',
+      stats: 'Ta bibliothèque en chiffres',
       series: s ? `${s} série${s > 1 ? 's' : ''}` : '',
       releases: state.releasesRefreshing ? 'Recherche des nouveautés…' : 'Les prochains tomes de tes séries',
       settings: '',
@@ -725,18 +728,178 @@
   }
   function shelfCols() { return Math.max(3, Math.floor((Math.min(window.innerWidth, 900) - 40) / 112)); }
 
-  // Mode « une série par étagère » : chaque étagère défile de gauche à droite
+  // Mode « une série par étagère » : une carte arrondie par série, couverture floutée en fond, tomes qui défilent
+  function seriesProgress(name, books) {
+    const info = (state.seriesInfo || {})[norm(name)];
+    const owned = new Set(books.map((b) => b.volume).filter(Boolean)).size;
+    if (!info || !info.fr) return null;
+    const total = Math.max(info.fr, owned);
+    return { owned, total, pct: Math.min(100, Math.round(owned / total * 100)), status: info.status, info };
+  }
   function seriesShelvesHTML(list) {
     const { groups, loose } = groupBySeries(list);
-    const T = themeOf(curTheme());
-    const shelves = groups.map((g) => ({ name: g.name, books: g.books, count: g.books.length + ' tome' + (g.books.length > 1 ? 's' : '') }));
-    if (loose.length) shelves.push({ name: 'Autres livres', books: loose, count: loose.length + ' livre' + (loose.length > 1 ? 's' : '') });
-    return '<div class="shelf">' + (T.top ? `<div class="shelf-top">${T.top}</div>` : '') + shelves.map((s, i) => `
-      <section class="series-shelf">
-        <div class="series-head"><b>${esc(s.name)}</b><span>${s.count}${s.books.length > 3 ? ' · glisse →' : ''}</span></div>
-        <div class="series-scroll">${s.books.map(bookHTML).join('')}</div>
-        ${plankHTML(i)}
-      </section>`).join('') + '</div>';
+    const cards = groups.map((g) => {
+      const n = g.books.length;
+      const pr = seriesProgress(g.name, g.books);
+      const bg = (g.books.find((b) => b.cover && !b.coverPhoto) || g.books.find((b) => b.cover) || {}).cover;
+      return `<section class="s-card">
+        ${bg ? `<img class="s-bg" src="${esc(bg)}" alt="" aria-hidden="true">` : ''}
+        <div class="s-top"><div class="s-names"><b>${esc(g.name)}</b><span>${n} tome${n > 1 ? 's' : ''}</span></div>
+          <button class="s-open" data-series-open="${esc(g.key)}" aria-label="Voir la série ${esc(g.name)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button></div>
+        <div class="series-scroll">${g.books.map(bookHTML).join('')}</div>
+        ${pr ? `<div class="s-prog"><div class="s-prog-row"><span>${pr.owned} sur ${pr.total} parus en France</span>${pr.status ? `<span class="s-pill ${pr.status === 'Terminée' ? 'done' : ''}">${pr.status}</span>` : ''}</div>
+          <div class="s-bar ${pr.status === 'Terminée' ? 'done' : ''}"><i style="width:${pr.pct}%"></i></div></div>` : ''}
+      </section>`;
+    });
+    if (loose.length) cards.push(`<section class="s-card"><div class="s-top"><div class="s-names"><b>Autres livres</b><span>${loose.length} livre${loose.length > 1 ? 's' : ''}</span></div></div>
+      <div class="series-scroll">${loose.map(bookHTML).join('')}</div></section>`);
+    return '<div class="s-cards">' + cards.join('') + '</div>';
+  }
+
+  // Infos des séries (tomes parus en France, parution d'origine, statut) : demandées au serveur en arrière-plan
+  let infoVer = 0, infoLoading = false;
+  async function loadSeriesInfo(force) {
+    if (infoLoading) return;
+    infoLoading = true;
+    try {
+      state.seriesInfo = state.seriesInfo || {};
+      for (const s of seriesList()) {
+        const maxOwned = Math.max(0, ...s.books.map((b) => b.volume || 0));
+        const cur = state.seriesInfo[s.key];
+        if (!force && cur && cur.maxOwned === maxOwned && Date.now() - (cur.at || 0) < 3 * 864e5) continue;
+        try {
+          const r = await api('seriesInfo', { series: s.name, books: s.books.map((b) => ({ isbn: b.isbn, volume: b.volume, publisher: b.publisher, category: b.category, format: b.format })) }, 120000);
+          if (r && r.info) { state.seriesInfo[s.key] = Object.assign({}, r.info, { maxOwned, at: Date.now() }); infoVer++; save(); scheduleRender(); }
+        } catch (e) { break; } // serveur injoignable : on réessaiera plus tard
+      }
+    } finally { infoLoading = false; }
+  }
+
+  // Page d'une série : progression de ta collection, parution en France et dans le pays d'origine, tomes manquants
+  function openSeries(key) {
+    const s = seriesList().find((x) => x.key === key);
+    if (!s) return;
+    const books = s.books.slice().sort((a, b) => (a.volume || 0) - (b.volume || 0));
+    const info = (state.seriesInfo || {})[key] || null;
+    const ownedVols = new Set(books.map((b) => b.volume).filter(Boolean));
+    const maxOwned = Math.max(0, ...ownedVols);
+    const fr = Math.max(info && info.fr || 0, maxOwned);
+    const covers = books.filter((b) => b.cover).slice(0, 3);
+    const first = books[0];
+    const ref = books.filter((b) => b.volume === maxOwned)[0] || first;
+    const missing = []; for (let v = 1; v <= Math.min(fr, 300); v++) if (!ownedVols.has(v)) missing.push(v);
+    const origin = info && info.origin ? info.origin.charAt(0).toUpperCase() + info.origin.slice(1) : '';
+    const originFr = /france|belgique/i.test(origin);
+    const inOrigin = origin ? (/^[aeiouyé]/i.test(origin) ? 'en ' : /^(japon|royaume|canada|portugal)/i.test(origin) ? 'au ' : /unis$/i.test(origin) ? 'aux ' : 'en ') + origin.replace(/^Japon$/i, 'Japon') : '';
+    const bar = (title, value, pct, color, note) => `<div class="sd-bar"><div class="sd-bar-row"><b>${title}</b><span>${value}</span></div>
+      <div class="s-bar ${color}"><i style="width:${Math.max(2, Math.min(100, pct))}%"></i></div>${note ? `<p>${note}</p>` : ''}</div>`;
+    let bars = bar('Ma collection', `${ownedVols.size} sur ${fr} tome${fr > 1 ? 's' : ''}`, fr ? ownedVols.size / fr * 100 : 0, '',
+      missing.length ? (missing.length === 1 ? `Il te manque le tome ${missing[0]}.` : `Il te manque ${missing.length} tomes (${volRange(missing)}).`) : 'Tu as tous les tomes parus en France.');
+    if (info && info.originCount && !originFr) {
+      const behind = info.originCount - fr;
+      bars += bar('Parution en France', `${fr} sur ${info.originCount} tomes`, fr / info.originCount * 100, 'fr',
+        behind > 0 ? `La France a ${behind} tome${behind > 1 ? 's' : ''} de retard sur l’édition d’origine.` : behind < 0 ? `L’édition française est découpée en plus de tomes que l’originale (${info.originCount}).` : 'La France est à jour.');
+      bars += bar('Parution ' + inOrigin, `${info.originCount} tomes`, 100, info.originFinished ? 'done' : 'origin',
+        info.originFinished ? 'Série terminée ' + inOrigin + '.' : 'Série toujours en cours ' + inOrigin + '.');
+    } else if (info && info.originFinished != null) {
+      bars += bar('Parution' + (inOrigin ? ' ' + inOrigin : ''), `${fr} tome${fr > 1 ? 's' : ''}`, 100, info.originFinished ? 'done' : 'origin',
+        info.originFinished ? 'Série terminée.' : 'Série toujours en cours.');
+    }
+    const nextRel = state.releases.filter((r) => norm(r.series) === key && r.date && dateKey(r.date) >= todayKey())
+      .sort((a, b) => dateKey(a.date).localeCompare(dateKey(b.date)))[0];
+    const days = nextRel ? Math.round((new Date(dateKey(nextRel.date)) - new Date(todayKey())) / 864e5) : 0;
+    const grid = [];
+    const top = Math.min(Math.max(fr, maxOwned), 300);
+    for (let v = 1; v <= top; v++) {
+      const b = books.find((x) => x.volume === v);
+      grid.push(b ? bookHTML(b) : `<div class="sd-miss" aria-label="Tome ${v} manquant">${v}</div>`);
+    }
+    for (const b of books.filter((x) => !x.volume)) grid.push(bookHTML(b));
+    const status = info && info.status;
+    openSheet(`<div class="book-card sd">
+        ${covers[0] ? `<div class="bc-backdrop" aria-hidden="true"><img src="${esc(covers[0].cover)}" alt=""></div>` : ''}
+        <div class="sd-head">
+          <div class="sd-fan">${covers.slice(1, 3).map((b, i) => `<img class="f${i + 1}" src="${esc(b.cover)}" alt="">`).join('')}${covers[0] ? `<img class="f0" src="${esc(covers[0].cover)}" alt="">` : ''}</div>
+          <h2 class="bc-title">${esc(s.name)}</h2>
+          <div class="bc-authors">${esc([first.authors, first.publisher].filter(Boolean).join(' · '))}</div>
+          <div class="bc-chips">${first.format ? `<span>${esc(first.format)}</span>` : ''}${status ? `<span class="${status === 'Terminée' ? 'st-done' : 'st-on'}">${status}</span>` : ''}</div>
+        </div>
+        <div class="sd-bars">${info ? bars : '<p class="muted small">Recherche de la parution de la série…</p>'}</div>
+        ${nextRel ? `<div class="sd-next"><div class="sd-miss small">${nextRel.volume ? 'T' + nextRel.volume : '?'}</div><div><span>PROCHAINE SORTIE</span><b>${nextRel.volume ? 'Tome ' + nextRel.volume + ' · ' : ''}${fmtDate(nextRel.date)}</b><small>${days <= 0 ? 'aujourd’hui' : days === 1 ? 'demain' : 'dans ' + days + ' jours'}</small></div></div>` : ''}
+        <div class="sd-vols-head"><h3>Les tomes</h3><span>${ownedVols.size} possédé${ownedVols.size > 1 ? 's' : ''}${missing.length ? ' · ' + missing.length + ' manquant' + (missing.length > 1 ? 's' : '') : ''}</span></div>
+        <div class="sd-grid" id="sdGrid">${grid.join('')}</div>
+      </div>
+      <div class="sheet-actions">
+        ${missing.length ? `<button class="btn primary block" id="sdFill">Ajouter ${missing.length === 1 ? 'le tome manquant' : 'les ' + missing.length + ' tomes manquants'}</button>` : ''}
+        <button class="btn ghost block" data-act="close">Fermer</button>
+      </div>`);
+    $('#sdGrid').onclick = (e) => { const it = e.target.closest('.book[data-id]'); if (it) openBook(it.dataset.id); };
+    if ($('#sdFill')) $('#sdFill').onclick = () => fillPrevious(ref, missing);
+    if (!info) loadSeriesInfo().then(() => { if ($('.book-card.sd') && (state.seriesInfo || {})[key]) openSeries(key); });
+  }
+
+  // ---------- Statistiques ----------
+  function renderStats() {
+    const el = $('#statsContent');
+    const books = state.books;
+    if (!books.length) { el.innerHTML = `<div class="empty"><h2>Pas encore de statistiques</h2><p>Scanne tes premiers livres pour voir les chiffres de ta bibliothèque.</p></div>`; return; }
+    const fmt = (n) => Math.round(n).toLocaleString('fr-FR');
+    const byCat = { roman: [], manga: [] };
+    for (const b of books) byCat[catOf(b)].push(b);
+    const pages = (l) => l.reduce((t, b) => t + (+b.pages || 0), 0);
+    const totalPages = pages(books);
+    const minutes = pages(byCat.manga) * 0.4 + pages(byCat.roman) * 1.3;
+    // valeur : prix neuf actuel ; sans prix connu, on prend la moyenne des livres du même type
+    const known = (l) => l.filter((b) => +b.price > 0);
+    const avg = (l, d) => { const k = known(l); return k.length ? k.reduce((t, b) => t + +b.price, 0) / k.length : d; };
+    const avgCat = { manga: avg(byCat.manga, 7.5), roman: avg(byCat.roman, 9) };
+    const value = books.reduce((t, b) => t + (+b.price > 0 ? +b.price : avgCat[catOf(b)]), 0);
+    const estimated = books.filter((b) => !(+b.price > 0)).length;
+    const series = seriesList();
+    let complete = 0, missingTotal = 0;
+    for (const s of series) {
+      const owned = new Set(s.books.map((b) => b.volume).filter(Boolean));
+      const max = Math.max(0, ...owned);
+      const info = (state.seriesInfo || {})[s.key];
+      const total = Math.max(info && info.fr || 0, max);
+      let miss = 0; for (let v = 1; v <= total; v++) if (!owned.has(v)) miss++;
+      missingTotal += miss;
+      if (!miss && total) complete++;
+    }
+    const pct = Math.round(byCat.roman.length / books.length * 100);
+    // ajouts des 6 derniers mois
+    const now = new Date();
+    const months = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const n = books.filter((b) => { const a = new Date(b.addedAt || 0); return a.getFullYear() === d.getFullYear() && a.getMonth() === d.getMonth(); }).length;
+      months.push({ label: d.toLocaleDateString('fr-FR', { month: 'short' }).replace('.', ''), n, cur: i === 0 });
+    }
+    const maxM = Math.max(1, ...months.map((m) => m.n));
+    const thick = books.filter((b) => +b.pages > 0).sort((a, b) => b.pages - a.pages)[0];
+    const pubs = {};
+    for (const b of books) if (b.publisher) { const k = norm(b.publisher).split(' ')[0]; (pubs[k] = pubs[k] || { name: b.publisher, n: 0 }).n++; }
+    const fav = Object.values(pubs).sort((a, b) => b.n - a.n)[0];
+    const hours = minutes / 60;
+    el.innerHTML = `<div class="st-wrap">
+      <div class="st-grid">
+        <div class="st-card"><span>Livres</span><b class="st-big">${fmt(books.length)}</b><small>dans ${series.length} série${series.length > 1 ? 's' : ''}</small></div>
+        <div class="st-card"><span>Pages</span><b class="st-big">${fmt(totalPages)}</b><small>≈ ${hours >= 1 ? fmt(hours) + ' h' : fmt(minutes) + ' min'} de lecture</small></div>
+        <div class="st-card st-money"><div class="st-ic" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 6.5A7 7 0 1 0 17.5 17.5"/><path d="M4 10.5h10M4 13.5h10"/></svg></div>
+          <div><span>Valeur estimée de ta bibliothèque</span><b class="st-big">≈ ${fmt(Math.round(value / 5) * 5)} €</b><small>d’après les prix neufs actuels en librairie${estimated ? ` (${estimated} prix estimé${estimated > 1 ? 's' : ''})` : ''}</small></div></div>
+      </div>
+      <div class="st-card st-block"><h3>Romans et mangas</h3>
+        <div class="st-split"><i class="r" style="width:${pct}%"></i><i class="m" style="width:${100 - pct}%"></i></div>
+        <div class="st-split-legend"><span><b class="r">${byCat.roman.length}</b> roman${byCat.roman.length > 1 ? 's' : ''} · ${fmt(pages(byCat.roman))} pages</span><span><b class="m">${byCat.manga.length}</b> manga${byCat.manga.length > 1 ? 's' : ''} · ${fmt(pages(byCat.manga))} pages</span></div></div>
+      <div class="st-card st-block"><h3>Mes séries</h3>
+        <div class="st-three"><div><b>${series.length}</b><span>suivies</span></div><div><b class="ok">${complete}</b><span>complètes</span></div><div><b class="warn">${missingTotal}</b><span>tomes manquants</span></div></div></div>
+      <div class="st-card st-block"><div class="st-head"><h3>Livres ajoutés</h3><span>6 derniers mois</span></div>
+        <div class="st-months">${months.map((m) => `<div><span class="n">${m.n}</span><i class="${m.cur ? 'cur' : ''}" style="height:${Math.max(4, Math.round(m.n / maxM * 70))}px"></i><span>${m.label}</span></div>`).join('')}</div></div>
+      <div class="st-grid">
+        ${thick ? `<div class="st-card"><span>Le plus épais</span><b>${esc(thick.title)}</b><small>${thick.pages} pages</small></div>` : ''}
+        ${fav ? `<div class="st-card"><span>Éditeur préféré</span><b>${esc(fav.name)}</b><small>${fav.n} livre${fav.n > 1 ? 's' : ''}</small></div>` : ''}
+      </div>
+    </div>`;
   }
 
   // Mode « séries regroupées » : une pile par série, qui se déplie quand on la touche
@@ -791,7 +954,7 @@
     const list = sortedBooks();
     if (!list.length) { libSig = ''; el.innerHTML = `<div class="empty"><p>Aucun livre ne correspond à ta recherche.</p></div>`; return; }
     const layout = state.settings.layout;
-    const sig = [layout, openPile, curTheme(), window.innerWidth, list.map((b) => b.id + ':' + (b.cover || '') + ':' + b.volume + ':' + (b.title || '')).join(',')].join('|');
+    const sig = [layout, openPile, infoVer, curTheme(), window.innerWidth, list.map((b) => b.id + ':' + (b.cover || '') + ':' + b.volume + ':' + (b.title || '')).join(',')].join('|');
     if (sig === libSig && el.childElementCount) return;
     libSig = sig;
 
@@ -1790,6 +1953,8 @@
     $('#importFile').addEventListener('change', (e) => { if (e.target.files[0]) importData(e.target.files[0]); e.target.value = ''; });
 
     $('#libraryContent').addEventListener('click', (e) => {
+      const so = e.target.closest('[data-series-open]');
+      if (so) { openSeries(so.dataset.seriesOpen); return; }
       const pile = e.target.closest('[data-pile]');
       if (pile) { openPile = openPile === pile.dataset.pile ? null : pile.dataset.pile; renderLibrary(); return; }
       if (e.target.closest('[data-regroup]')) { openPile = null; renderLibrary(); return; }
@@ -1845,7 +2010,7 @@
 
   // Synchro en ligne, puis sorties (recherchées automatiquement), puis rangement Romans / Mangas
   setTimeout(() => {
-    syncNow().then(() => { autoReleases(); return classifyLibrary(); }).catch(() => {});
+    syncNow().then(() => { autoReleases(); return classifyLibrary(); }).catch(() => {}).then(() => loadSeriesInfo()).catch(() => {});
   }, 300);
   // Couvertures manquantes, sans gêner le démarrage
   setTimeout(() => repairCovers().catch(() => {}).then(() => upgradeCovers()).catch(() => {}), 4000);

@@ -12,7 +12,7 @@ const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SE
   auth: { persistSession: false },
 });
 const GKEY = Deno.env.get("GOOGLE_BOOKS_KEY") || "";
-const CACHE_V = 7; // à augmenter quand la façon de lire les catalogues change
+const CACHE_V = 8; // à augmenter quand la façon de lire les catalogues change
 const clean = (b: any) => { if (!b) return b; const { _m, ...rest } = b; return rest; };
 
 const CORS = {
@@ -177,7 +177,7 @@ function parseUnimarc(rec) {
     isbn: /^97[89]\d{10}$/.test(isbn) ? isbn : '', title, authors: [...new Set(authors)].join(', '),
     publisher: sub(pubF, 'c'), publishedDate: year, pages, description: sub(marcFields(rec, '330')[0], 'a'),
     cover: hasCover && ark ? 'https://catalogue.bnf.fr/couverture?&appName=NE&idArk=' + ark + '&couverture=1' : '',
-    series, volume, ark, subjects, collection: colls.join(', '), kind: bookKind, light, origLang,
+    series, volume, ark, subjects, collection: colls.join(', '), kind: bookKind, light, origLang, price: price || null,
     // indices pour reconnaître la même édition (format, prix, collection) et écarter les produits dérivés
     _m: { main: norm(main), sub: norm(subt), colls, price, size },
   };
@@ -406,6 +406,7 @@ async function srcLeslibraires(isbn: string) {
     description: strip(g(/<p itemprop="description">([\s\S]*?)<\/p>/)),
     cover: cover.replace("/s:800:800/", "/s:600:600/"), collection, subjects: rayons.concat(collection ? [collection] : []),
     preorder: /schema\.org\/PreOrder/.test(html), src: "Leslibraires",
+    price: parseFloat((html.match(/itemprop="price"\s+content="([\d.,]+)"/) || html.match(/content="([\d.,]+)"\s+itemprop="price"/) || [])[1]?.replace(",", ".") || "") || null,
   };
 }
 // Place des Libraires : une seule demande à la fois, espacées ; si le site dit « trop de demandes », on attend
@@ -506,6 +507,7 @@ async function lookup(isbn: string) {
     pages: first(ll?.pages, gg?.pages, pickAll("pages")) || null,
     description: first(ll?.description, bnf?.description, gg?.description, pdl?.description, pickAll("description")),
     series, volume, ark: bnf?.ark || "", collection: first(ll?.collection, pdl?.collection, bnf?.collection),
+    price: first(ll?.price, pdl?.price, bnf?.price) || null,
   };
   // Type de livre, du plus sûr au moins sûr : la notice BnF, le mot « roman » / « light novel » dans un titre, puis rayon et éditeur
   // (les rayons des libraires sont parfois faux : Leslibraires range le roman Solo Leveling en BD)
@@ -620,10 +622,11 @@ async function placeDesLibraires(query: string) {
     const collection = strip((block.match(/class="collection[^"]*">\s*<span>([\s\S]*?)<\/span>/) || [])[1] || "");
     const authors = strip((block.match(/class="livre_auteur"[^>]*title="([^"]*)"/) || [])[1] || "");
     const description = strip((block.match(/class="livre_resume[^"]*">([\s\S]*?)<\/p>/) || [])[1] || "");
+    const price = parseFloat(((block.match(/(\d{1,3}[.,]\d{2})\s*(?:&nbsp;)?\s*(?:&euro;|€)/) || [])[1] || "").replace(",", ".")) || null;
     if (!isbn || !title) continue;
     const ps = parseSeries(title);
     out.push({ isbn, title, publisher, date, series: ps.series, volume: ps.volume, src: "Place des Libraires",
-      collection, authors, description, subjects: [collection],
+      collection, authors, description, subjects: [collection], price,
       cover: "https://images.epagine.fr/" + isbn.slice(-3) + "/" + isbn + "_1_m.jpg" });
   }
   return out;
@@ -812,6 +815,83 @@ async function computeReleases(libraryId: string) {
   return { library_id: libraryId, releases, report, checked_at: new Date().toISOString() };
 }
 
+// ---------- Infos d'une série : tomes parus en France, parution d'origine (Wikipédia) ----------
+const WIKI = "https://fr.wikipedia.org/w/api.php?format=json&";
+const wikiGet = (q: string) => withRetry(() => hostLimited("wiki", async () => {
+  const r = await fetch(WIKI + q, { signal: AbortSignal.timeout(12000), headers: { "User-Agent": "MaBibliotheque/1.0 (application de bibliothèque personnelle)" } });
+  if (!r.ok) throw new Error("erreur " + r.status);
+  return await r.json();
+}, 300), 2);
+async function wikiSeries(name: string, light: boolean, manga: boolean) {
+  const base = baseName(name);
+  const nb = norm(base);
+  // plusieurs formulations : le type du livre n'est pas toujours connu
+  const queries = [...new Set([base + (light ? " light novel" : manga ? " manga" : " roman"), base + " manga", base])];
+  let title = "";
+  for (const q of queries) {
+    const s = await wikiGet("action=query&list=search&srlimit=6&srsearch=" + encodeURIComponent(q));
+    const hits: string[] = (s.query?.search || []).map((h: any) => h.title);
+    title = hits.find((t) => norm(t.replace(/\(.*\)/, "")) === nb) || hits.find((t) => norm(t).startsWith(nb + " ") && /\(/.test(t)) || "";
+    if (title) break;
+  }
+  if (!title) return null;
+  const p = await wikiGet("action=parse&prop=wikitext&section=0&redirects=1&page=" + encodeURIComponent(title));
+  const t: string = p.parse?.wikitext?.["*"] || "";
+  const field = (b: string, k: string) => ((b.match(new RegExp("\\n\\s*\\|\\s*" + k + "\\s*=([^\\n]*)")) || [])[1] || "").trim();
+  const clean = (v: string) => v.replace(/\[\[(?:[^\]|]*\|)?([^\]]*)\]\]/g, "$1").replace(/<[^>]+>/g, "").replace(/'{2,}/g, "").trim();
+  const books = t.split(/\{\{Infobox Animation et bande dessinée asiatiques\/Livre/i).slice(1).map((b) => {
+    b = "\n" + b.split(/\n\}\}/)[0];
+    const last = field(b, "dernier_volume");
+    return { format: norm(field(b, "format")), origin: clean(field(b, "origine")), count: +((field(b, "nb_volumes").match(/\d+/) || [0])[0]) || null,
+      finished: /\d{4}/.test(last) };
+  });
+  const pick = books.find((x) => light ? x.format.includes("roman") : x.format === "bd") || (light ? null : books[0]);
+  if (pick) return { title, origin: pick.origin, count: pick.count, finished: pick.finished };
+  // roman « classique » : Infobox Livre (années de parution d'origine « 2004 – 2023 »)
+  const d = (t.match(/\|\s*dateparution_orig\s*=([^\n]*)/) || t.match(/\|\s*dateparution\s*=([^\n]*)/) || [])[1] || "";
+  const years = d.match(/\b(?:1[89]|20)\d{2}\b/g) || [];
+  if (!years.length) return null;
+  return { title, origin: clean((t.match(/\|\s*pays\s*=([^\n]*)/) || [])[1] || "").replace(/\{\{|\}\}/g, ""), count: null, finished: years.length > 1 };
+}
+// Dernier tome paru en France (BnF), en partant du dernier tome possédé
+async function frLatest(name: string, books: any[]) {
+  const vols = books.map((b) => b.volume).filter(Boolean);
+  const maxOwned = vols.length ? Math.max(...vols) : 0;
+  if (!maxOwned) return 0;
+  const key = norm(name);
+  const last = books.filter((b) => b.volume === maxOwned).find((b) => b.isbn) || books[0];
+  let ref: any = null;
+  if (last?.isbn) { try { ref = await srcBnf(last.isbn); } catch { /* sans référence */ } }
+  if (!ref) ref = { publisher: last?.publisher || "" };
+  let latest = maxOwned, misses = 0;
+  for (let v = maxOwned + 1; v <= maxOwned + 60 && misses < 2; v++) {
+    try {
+      const recs = await withRetry(() => bnfVolumeSearch(name, v, ref.publisher), 2);
+      if (pickVolume(recs, v, key, ref)) { latest = v; misses = 0; } else misses++;
+    } catch { misses++; }
+  }
+  return latest;
+}
+const INFO_TTL = 7 * 864e5;
+async function seriesInfo(name: string, books: any[]) {
+  const vols = books.map((b) => b.volume).filter(Boolean);
+  const maxOwned = vols.length ? Math.max(...vols) : 0;
+  const first = books[0] || {};
+  const key = "info|" + norm(name) + "|" + pubWord(first.publisher || "") + "|" + maxOwned;
+  const { data: c } = await db.from("series_cache").select("data, checked_at").eq("key", key).maybeSingle();
+  if (c && Date.now() - new Date(c.checked_at).getTime() < INFO_TTL) return c.data;
+  const light = LN_RE.test(name) || books.some((b) => b.format === "Light novel");
+  const manga = !light && books.some((b) => b.category === "manga" || /manga|manhwa|bd|comics/i.test(b.format || ""));
+  const [fr, wiki] = await Promise.all([frLatest(name, books).catch(() => maxOwned), wikiSeries(name, light, manga).catch(() => null)]);
+  const sameCountry = wiki && /^france$|belgique/i.test(norm(wiki.origin || ""));
+  const frCount = Math.max(fr || 0, maxOwned, sameCountry && wiki?.count ? wiki.count : 0);
+  const done = !!wiki?.finished && (!wiki.count || frCount >= wiki.count);
+  const info = { fr: frCount, origin: wiki?.origin || "", originCount: wiki?.count || null, originFinished: wiki ? !!wiki.finished : null,
+    status: wiki ? (done ? "Terminée" : "En cours") : "", wiki: wiki?.title || "" };
+  await db.from("series_cache").upsert({ key, data: info, checked_at: new Date().toISOString() });
+  return info;
+}
+
 // ---------- Bibliothèques (sans compte : un identifiant + un code secret) ----------
 async function sha(s: string) {
   const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -877,6 +957,7 @@ Deno.serve(async (req) => {
       }
       return json({ cover });
     }
+    if (action === "seriesInfo") return json({ info: await seriesInfo(String(body.series || ""), Array.isArray(body.books) ? body.books.slice(0, 300) : []) });
     if (action === "volumes") return json({ volumes: await volumes(String(body.series || ""), (body.volumes || []).map(Number).filter((n: number) => n > 0), String(body.publisher || ""), String(body.refIsbn || "")) });
 
     if (action === "register") {
