@@ -12,7 +12,7 @@ const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SE
   auth: { persistSession: false },
 });
 const GKEY = Deno.env.get("GOOGLE_BOOKS_KEY") || "";
-const CACHE_V = 5; // à augmenter quand la façon de lire les catalogues change
+const CACHE_V = 6; // à augmenter quand la façon de lire les catalogues change
 const clean = (b: any) => { if (!b) return b; const { _m, ...rest } = b; return rest; };
 
 const CORS = {
@@ -232,38 +232,109 @@ async function srcOpenLibrary(isbn: string): Promise<Book | null> {
 }
 
 // ---------- Couvertures ----------
-async function imgSize(url: string) {
+// Télécharge une image : taille, largeur et empreinte (pour reconnaître les images « pas de couverture »)
+async function imgInfo(url: string) {
   try {
-    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!r.ok || !(r.headers.get("content-type") || "").startsWith("image")) return 0;
-    return (await r.arrayBuffer()).byteLength;
-  } catch { return 0; }
+    const r = await fetch(url, { signal: AbortSignal.timeout(8000), headers: { "User-Agent": UA["User-Agent"] } });
+    if (!r.ok || !(r.headers.get("content-type") || "").startsWith("image")) return { size: 0, w: 0, hash: "" };
+    const b = new Uint8Array(await r.arrayBuffer());
+    let w = 0;
+    if (b[0] === 0xff && b[1] === 0xd8) {
+      for (let i = 2; i < b.length - 9;) {
+        if (b[i] !== 0xff) { i++; continue; }
+        const m = b[i + 1], len = (b[i + 2] << 8) | b[i + 3];
+        if (m >= 0xc0 && m <= 0xc3) { w = (b[i + 7] << 8) | b[i + 8]; break; }
+        i += 2 + len;
+      }
+    } else if (b[0] === 0x47) w = b[6] | (b[7] << 8);
+    else if (b[0] === 0x89) w = (b[18] << 8) | b[19];
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-1", b))].slice(0, 8).map((x) => x.toString(16).padStart(2, "0")).join("");
+    return { size: b.length, w, hash };
+  } catch { return { size: 0, w: 0, hash: "" }; }
 }
-const okImage = async (u: string) => !!u && (await imgSize(u)) > 2500;
-const placeholder: Record<string, number> = {};
-async function realImage(kind: string, url: string, fakeUrl: string) {
-  const size = await imgSize(url);
-  if (size < 2500) return false;
-  if (!(kind in placeholder)) placeholder[kind] = await imgSize(fakeUrl);
-  return Math.abs(size - placeholder[kind]) > 64;
+const imgSize = async (url: string) => (await imgInfo(url)).size;
+// Images « pas de couverture » déjà repérées (Google en a plusieurs versions)
+const FAKE = new Set(["ba8cd5043eed", "f3426f39acd1"]);
+const fakeProbe: Record<string, Promise<void>> = {};
+const FAKE_URL: Record<string, string> = {
+  google: "https://books.google.com/books/content?vid=ISBN9780000000002&printsec=frontcover&img=1&zoom=1",
+  bnf: "https://catalogue.bnf.fr/couverture?&appName=NE&idArk=ark:/12148/cb00000000x&couverture=1",
+  decitre: "https://products-images.di-static.com/image/x/9780000000002-475x500-1.jpg",
+  epagine: "https://images.epagine.fr/002/9780000000002_1_m.jpg",
+};
+const kindOf = (u: string) => /books\.google|googleusercontent/.test(u) ? "google" : /bnf\.fr/.test(u) ? "bnf" : /di-static/.test(u) ? "decitre" : /epagine/.test(u) ? "epagine" : "";
+// Vraie couverture : une image assez grande, qui n'est pas l'image de remplacement du site
+async function okImage(u: string) {
+  if (!u) return false;
+  const kind = kindOf(u);
+  if (kind && !fakeProbe[kind]) fakeProbe[kind] = imgInfo(FAKE_URL[kind]).then((f) => { if (f.hash) FAKE.add(f.hash.slice(0, 12)); });
+  const [info] = await Promise.all([imgInfo(u), kind ? fakeProbe[kind] : null]);
+  if (info.size < 2500 || (info.w && info.w < 60)) return false;
+  return !FAKE.has(info.hash.slice(0, 12));
 }
-async function findCover(isbn: string, ark?: string) {
-  if (!isbn) return "";
+
+// Amazon : image directe pour les ISBN en 978, sinon recherche sur amazon.fr (marche aussi pour les 979)
+const AMZ_STOP = new Set(["tome", "tomes", "vol", "volume", "les", "des", "une", "the", "edition", "manga", "roman"]);
+function amazonMatch(hint: any, title: string) {
+  const t = " " + norm(title) + " ";
+  const words = norm(hint.series || hint.title || "").split(" ").filter((w) => w.length > 2 && !AMZ_STOP.has(w));
+  if (!words.length) return false;
+  const found = words.filter((w) => t.includes(" " + w + " ")).length;
+  if (found / words.length < 0.7) return false;
+  const vol = hint.volume || parseSeries(hint.title || "").volume;
+  return !vol || new RegExp(" (t|tome|vol|volume|n)? ?0*" + vol + " ").test(t);
+}
+async function amazonCandidates(isbn: string) {
+  const html = await withRetry(() => hostLimited("amazon", () => getPage("https://www.amazon.fr/s?k=" + isbn + "&i=stripbooks", 12000), 800), 2);
+  const out: { asin: string; img: string; title: string }[] = [];
+  const parts = html.split(/<div[^>]*data-component-type="s-search-result"/).slice(1, 5);
+  const heads = [...html.matchAll(/<div[^>]*data-asin="([A-Z0-9]{10})"[^>]*data-component-type="s-search-result"|<div[^>]*data-component-type="s-search-result"[^>]*data-asin="([A-Z0-9]{10})"/g)];
+  parts.forEach((p, i) => {
+    const img = (p.match(/class="s-image"[^>]*src="([^"]+)"/) || p.match(/src="([^"]+)"[^>]*class="s-image"/) || [])[1] || "";
+    const title = xmlDecode((p.match(/<h2[^>]*aria-label="([^"]+)"/) || [])[1] || strip((p.match(/<h2[^>]*>([\s\S]*?)<\/h2>/) || [])[1] || ""));
+    const h = heads[i];
+    if (img) out.push({ asin: (h && (h[1] || h[2])) || "", img: img.replace(/\._[^/]*_\.(jpg|jpeg|png)$/i, "._SL600_.$1"), title });
+  });
+  return out;
+}
+async function amazonPick(isbn: string, hint: any, cands?: Promise<any[]>) {
   const i10 = isbn13to10(isbn);
   if (i10) {
     const u = "https://images-na.ssl-images-amazon.com/images/P/" + i10 + ".01.LZZZZZZZ.jpg";
     if ((await imgSize(u)) > 1000) return u;
   }
+  let list: any[] = [];
+  try { list = await (cands || amazonCandidates(isbn)); } catch { return ""; }
+  const c = list.find((x) => (i10 && x.asin === i10) || amazonMatch(hint || {}, x.title));
+  return c && (await imgSize(c.img)) > 2500 ? c.img : "";
+}
+
+async function findCover(isbn: string, ark?: string, hint?: any) {
+  if (!isbn) return "";
+  if (!hint || !(hint.title || hint.series)) {
+    const { data: c } = await db.from("book_cache").select("data").eq("isbn", isbn).maybeSingle();
+    if (c?.data) hint = { title: c.data.title, series: c.data.series, volume: c.data.volume };
+  }
+  // 1) Amazon
+  const amz = await amazonPick(isbn, hint).catch(() => "");
+  if (amz) return amz;
+  // 2) Decitre (image par ISBN, bonne qualité)
+  const dec = "https://products-images.di-static.com/image/x/" + isbn + "-475x500-1.jpg";
+  if (await okImage(dec)) return dec;
+  // 3) Leslibraires
+  try { const ll = await srcLeslibraires(isbn); if (ll?.cover && (await okImage(ll.cover))) return ll.cover; } catch { /* suivant */ }
+  // 4) BnF
   let a = ark;
   if (!a) { try { a = (await bnfSearch('bib.isbn all "' + isbn + '"', 1))[0]?.ark; } catch { /* rien */ } }
   if (a) {
     const u = "https://catalogue.bnf.fr/couverture?&appName=NE&idArk=" + a + "&couverture=1";
-    if (await realImage("bnf", u, "https://catalogue.bnf.fr/couverture?&appName=NE&idArk=ark:/12148/cb00000000x&couverture=1")) return u;
+    if (await okImage(u)) return u;
   }
+  // 5) Open Library, Google
   const ol = "https://covers.openlibrary.org/b/isbn/" + isbn + "-L.jpg?default=false";
-  if ((await imgSize(ol)) > 1000) return ol;
+  if (await okImage(ol)) return ol;
   const g = "https://books.google.com/books/content?vid=ISBN" + isbn + "&printsec=frontcover&img=1&zoom=1";
-  if (await realImage("google", g, "https://books.google.com/books/content?vid=ISBN9780000000002&printsec=frontcover&img=1&zoom=1")) return g;
+  if (await okImage(g)) return g;
   return "";
 }
 
@@ -360,6 +431,8 @@ function categorize(parts: any[]): string {
 
 // ---------- Recherche d'un livre ----------
 async function lookup(isbn: string) {
+  // la recherche Amazon (pour la couverture) part tout de suite, en même temps que les catalogues
+  const amzCands = isbn13to10(isbn) ? undefined : amazonCandidates(isbn).catch(() => []);
   const sources: [string, (i: string) => Promise<any>][] = [
     ["BnF", srcBnf], ["Leslibraires", srcLeslibraires], ["Place des Libraires", srcPdl], ["Google Books", srcGoogle], ["Open Library", srcOpenLibrary],
   ];
@@ -411,11 +484,13 @@ async function lookup(isbn: string) {
     series, volume, ark: bnf?.ark || "", collection: first(ll?.collection, pdl?.collection, bnf?.collection),
   };
   b.category = categorize([found.map((f: any) => [f.subjects, f.collection]), b.publisher, b.collection]);
-  // couverture : Leslibraires (grande et fiable), puis BnF vérifiée, puis les autres sources
-  const cands = [ll?.cover, bnf?.cover, pdl?.cover, gg?.cover, pickAll("cover")].filter(Boolean);
-  b.cover = "";
-  for (const c of cands) { if (c === ll?.cover || (await okImage(c))) { b.cover = c; break; } }
-  if (!b.cover) b.cover = await findCover(isbn, b.ark);
+  // couverture : Amazon d'abord, puis Leslibraires, Decitre, BnF et les autres (chaque image est vérifiée)
+  b.cover = await amazonPick(isbn, { title: b.title, series: b.series, volume: b.volume }, amzCands).catch(() => "");
+  if (!b.cover) {
+    const cands = [ll?.cover, "https://products-images.di-static.com/image/x/" + isbn + "-475x500-1.jpg", bnf?.cover, pdl?.cover, gg?.cover, pickAll("cover")].filter(Boolean);
+    for (const c of [...new Set(cands)]) { if (await okImage(c)) { b.cover = c; break; } }
+  }
+  if (!b.cover) b.cover = await findCover(isbn, b.ark, b);
   return { book: b, report, networkError: false };
 }
 
@@ -469,7 +544,7 @@ async function volumes(series: string, vols: number[], publisher: string, refIsb
       } catch { /* Google ensuite */ }
       if (!best && gIndex.has(v)) best = gIndex.get(v)!;
       if (best && best.cover && !(await okImage(best.cover))) best.cover = "";
-      if (best && best.isbn && !best.cover) best.cover = await findCover(best.isbn, best.ark);
+      if (best && best.isbn && !best.cover) best.cover = await findCover(best.isbn, best.ark, best);
       out[v] = clean(best);
     }
   };
@@ -635,7 +710,7 @@ async function releasesForSeries(name: string, books: any[], report: any) {
   for (const r of list) { r.out = false; r.id = "srv-" + key.replace(/ /g, "-") + "-" + r.volume; }
   report.ll = report.ll || { ok: 0, err: 0, last: "" }; report.ll.ok++;
   await Promise.all(list.filter((r) => r.cover && !/leslibraires/.test(r.cover)).map(async (r) => { if (!(await okImage(r.cover))) r.cover = ""; }));
-  await Promise.all(list.filter((r) => !r.cover && r.isbn).slice(0, 6).map(async (r) => { r.cover = await findCover(r.isbn); }));
+  await Promise.all(list.filter((r) => !r.cover && r.isbn).slice(0, 6).map(async (r) => { r.cover = await findCover(r.isbn, "", r); }));
   return { list, failed: pdlFailed || pdlPartial };
 }
 const SERIES_TTL = 6 * 3600e3; // une série est revérifiée au plus toutes les 6 heures
@@ -751,7 +826,15 @@ Deno.serve(async (req) => {
       await Promise.all([worker(), worker(), worker()]);
       return json({ books: out });
     }
-    if (action === "cover") return json({ cover: await findCover(String(body.isbn || ""), body.ark) });
+    if (action === "cover") {
+      const isbn = String(body.isbn || "").replace(/[^0-9X]/gi, "");
+      const cover = await findCover(isbn, body.ark, { title: body.title, series: body.series, volume: body.volume });
+      if (cover) {
+        const { data: c } = await db.from("book_cache").select("data").eq("isbn", isbn).maybeSingle();
+        if (c?.data) await db.from("book_cache").update({ data: { ...c.data, cover } }).eq("isbn", isbn);
+      }
+      return json({ cover });
+    }
     if (action === "volumes") return json({ volumes: await volumes(String(body.series || ""), (body.volumes || []).map(Number).filter((n: number) => n > 0), String(body.publisher || ""), String(body.refIsbn || "")) });
 
     if (action === "register") {

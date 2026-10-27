@@ -345,13 +345,32 @@
   }
 
   // Couverture cherchée en arrière-plan : l'écran s'affiche tout de suite, l'image arrive ensuite
-  async function findCoverAny(isbn, ark) {
-    try { const r = await api('cover', { isbn, ark }, 30000); if (r.cover) return r.cover; } catch (e) { /* recherche directe */ }
+  // Le serveur cherche d'abord sur Amazon (le titre sert à vérifier que c'est le bon livre), puis chez les libraires
+  async function findCoverAny(isbn, ark, b) {
+    const info = b ? { title: b.title || '', series: b.series || '', volume: b.volume || null } : {};
+    try { const r = await api('cover', Object.assign({ isbn, ark }, info), 30000); return r.cover || ''; } catch (e) { /* serveur injoignable : recherche directe */ }
     return findCover(isbn, ark);
+  }
+  // Une seule fois : on remplace les couvertures qui ne viennent pas d'Amazon (fausses images Google, images BnF très lourdes)
+  const isAmazon = (u) => /media-amazon\.com|images-amazon\.com/.test(u || '');
+  async function upgradeCovers() {
+    const todo = state.books.filter((b) => b.isbn && !b.coverPhoto && (b.coverV || 0) < 2 && !isAmazon(b.cover));
+    let changed = 0;
+    for (const b of todo) {
+      let u;
+      try { u = (await api('cover', { isbn: b.isbn, ark: b.ark, title: b.title || '', series: b.series || '', volume: b.volume || null }, 30000)).cover || ''; }
+      catch (e) { return; } // pas de réseau : on réessaiera au prochain lancement
+      b.coverV = 2;
+      if (u && u !== b.cover) { b.cover = u; changed++; }
+      save();
+      if (changed && changed % 5 === 0) scheduleRender();
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    if (changed) { scheduleRender(); toast(changed + ' couverture' + (changed > 1 ? 's' : '') + ' améliorée' + (changed > 1 ? 's' : '')); }
   }
   function coverLater(b) {
     if (!b.isbn || b.coverPhoto || b.cover) return;
-    findCoverAny(b.isbn, b.ark).then((u) => {
+    findCoverAny(b.isbn, b.ark, b).then((u) => {
       if (!u) return;
       b.cover = u; b.coverTriedAt = Date.now();
       const pv = $('#previewCover'); if (pv) pv.innerHTML = coverHTML(b);
@@ -407,9 +426,7 @@
     // 3) Open Library
     const ol = 'https://covers.openlibrary.org/b/isbn/' + isbn + '-L.jpg?default=false';
     if (await imageOk(ol)) return ol;
-    // 4) Google Books (image directe par ISBN)
-    const g = 'https://books.google.com/books/content?vid=ISBN' + isbn + '&printsec=frontcover&img=1&zoom=1';
-    if (await realImage('google', g, 'https://books.google.com/books/content?vid=ISBN9780000000002&printsec=frontcover&img=1&zoom=1')) return g;
+    // (Google n'est plus utilisé ici : il renvoie souvent une image « pas de couverture » qu'on ne peut pas reconnaître)
     return '';
   }
 
@@ -438,7 +455,7 @@
     const todo = state.books.filter((b) => !b.cover && b.isbn && (!b.coverTriedAt || Date.now() - b.coverTriedAt > 3 * 864e5));
     let fixed = 0;
     for (const b of todo.slice(0, 15)) {
-      const u = await findCoverAny(b.isbn, b.ark).catch(() => '');
+      const u = await findCoverAny(b.isbn, b.ark, b).catch(() => '');
       b.coverTriedAt = Date.now();
       if (u) { b.cover = u; fixed++; }
       save();
@@ -467,7 +484,7 @@
     const b = state.books.find((x) => x.id === id);
     if (!b || b.coverPhoto || !b.isbn) return;
     const bad = b.cover;
-    findCoverAny(b.isbn, b.ark).then((u) => {
+    findCoverAny(b.isbn, b.ark, b).then((u) => {
       if (u && u !== bad) b.cover = u; else { b.cover = ''; b.coverTriedAt = Date.now(); }
       save(); scheduleRender();
     }).catch(() => {});
@@ -1009,7 +1026,7 @@
     }
     save(); render();
     // Couvertures : l'une après l'autre, en arrière-plan
-    (async () => { for (const nb of added) { if (!nb.cover && nb.isbn) { const u = await findCoverAny(nb.isbn, nb.ark).catch(() => ''); nb.coverTriedAt = Date.now(); if (u) { nb.cover = u; save(); scheduleRender(); } } } })();
+    (async () => { for (const nb of added) { if (!nb.cover && nb.isbn) { const u = await findCoverAny(nb.isbn, nb.ark, nb).catch(() => ''); nb.coverTriedAt = Date.now(); if (u) { nb.cover = u; save(); scheduleRender(); } } } })();
     openSheet(`<h2>✅ ${added.length} tome${added.length > 1 ? 's' : ''} ajouté${added.length > 1 ? 's' : ''}</h2>
       <p class="muted">${esc(ref.series)} : tu as maintenant les tomes 1 à ${ref.volume}${cancelled ? ' (ajout arrêté en cours de route)' : ''}.</p>
       ${withInfo < added.length ? `<p class="muted small">${added.length - withInfo} tome${added.length - withInfo > 1 ? 's' : ''} sans fiche détaillée trouvée : ils sont ajoutés avec le nom de la série et leur numéro.</p>` : ''}
@@ -1306,8 +1323,9 @@
     };
     if ($('#cvSearch')) $('#cvSearch').onclick = async () => {
       $('#cvSearch').textContent = 'Recherche…'; $('#cvSearch').disabled = true;
-      const u = await findCoverAny(b.isbn, b.ark).catch(() => '');
-      if (u) { b.cover = u; b.coverPhoto = false; save(); render(); toast('Couverture trouvée 🎉'); onDone(); }
+      const u = await findCoverAny(b.isbn, b.ark, b).catch(() => '');
+      if (u && u === b.cover && !b.coverPhoto) { toast('Pas de meilleure couverture trouvée, essaie une photo'); $('#cvSearch').textContent = '🔎 Chercher automatiquement'; $('#cvSearch').disabled = false; }
+      else if (u) { b.cover = u; b.coverPhoto = false; b.coverV = 2; save(); render(); toast('Couverture trouvée 🎉'); onDone(); }
       else { toast('Aucune couverture trouvée, essaie une photo'); $('#cvSearch').textContent = '🔎 Chercher automatiquement'; $('#cvSearch').disabled = false; }
     };
     if ($('#cvRemove')) $('#cvRemove').onclick = () => { b.cover = ''; save(); render(); onDone(); };
@@ -1599,7 +1617,7 @@
     syncNow().then(() => { autoReleases(); return classifyLibrary(); }).catch(() => {});
   }, 300);
   // Couvertures manquantes, sans gêner le démarrage
-  setTimeout(() => repairCovers().catch(() => {}), 4000);
+  setTimeout(() => repairCovers().catch(() => {}).then(() => upgradeCovers()).catch(() => {}), 4000);
 
   // Pour les tests
   window.__biblio = { parseSeries, state: () => state };
