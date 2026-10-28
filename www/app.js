@@ -453,9 +453,12 @@
 
   // Au démarrage : on retente de trouver les couvertures manquantes (tous les 3 jours par livre)
   async function repairCovers() {
-    const todo = state.books.filter((b) => !b.cover && b.isbn && (!b.coverTriedAt || Date.now() - b.coverTriedAt > 3 * 864e5));
+    // nouvelles sources de couvertures (BDfugue…) : on réessaie une fois tous les livres sans couverture
+    const retry = (b) => (b.coverSrcV || 0) < 2;
+    const todo = state.books.filter((b) => !b.cover && b.isbn && (retry(b) || !b.coverTriedAt || Date.now() - b.coverTriedAt > 3 * 864e5));
     let fixed = 0;
-    for (const b of todo.slice(0, 15)) {
+    for (const b of todo.slice(0, 60)) {
+      b.coverSrcV = 2;
       const u = await findCoverAny(b.isbn, b.ark, b).catch(() => '');
       b.coverTriedAt = Date.now();
       if (u) { b.cover = u; fixed++; }
@@ -587,10 +590,26 @@
 
   // ---------- Bibliothèques Romans / Mangas ----------
   const CATS = { roman: { label: 'Romans', one: 'roman', icon: '📖' }, manga: { label: 'Mangas', one: 'manga', icon: '🎌' } };
-  const MANGA_PUB = ['pika', 'kana', 'ki oon', 'kioon', 'kurokawa', 'tonkam', 'kaze', 'doki doki', 'akata', 'soleil manga', 'crunchyroll',
-    'noeve', 'mangetsu', 'meian', 'glenat manga', 'panini manga', 'black box', 'ototo', 'taifu', 'nobi nobi', 'kbooks', 'sakka', 'naban',
-    'isan manga', 'omake', 'lezard noir', 'imho', 'vega', 'dupuis manga', 'kotoji', 'hikari', 'komikku', 'mana books', 'h2t', 'shiba',
-    'bamboo manga', 'michel lafon manga', 'nazca', 'delcourt tonkam', 'ankama', 'fleurus manga'];
+  const MANGA_ONLY = [
+  // mangas
+  "pika", "kana", "ki oon", "kioon", "kurokawa", "tonkam", "kaze", "doki doki", "akata", "soleil manga", "crunchyroll", "noeve", "noeve grafx",
+  "mangetsu", "meian", "glenat manga", "glenat", "panini manga", "black box", "ototo", "taifu", "nobi nobi", "kbooks", "sakka", "naban",
+  "isan manga", "omake", "lezard noir", "imho", "vega", "vega dupuis", "dupuis manga", "kotoji", "hikari", "komikku", "mana books", "h2t", "shiba",
+  "bamboo manga", "doki", "michel lafon manga", "nazca", "delcourt tonkam", "ankama", "casterman sakka", "fleurus manga", "rue de sevres manga",
+  "kazoku", "ynnis", "boy s love", "hana", "hana collection", "idp", "taifu yaoi", "boys love", "ecchi", "hot manga", "tonkam yaoi", "asuka",
+  "pika graphic", "kurokawa kids", "glenat jeunesse manga", "akileos manga", "dynamite", "j ai lu manga", "milan manga", "nobi", "makma",
+  "kana dark", "kioon kids", "soleil manga seinen", "kaze manga", "delcourt manga",
+  // manhwas, webtoons
+  "delitoon", "webtoon factory", "kotoon", "michel lafon webtoon", "piccoma", "kbooks webtoon", "verytoon", "toomics",
+];
+  const BD_PUB = [
+  // BD franco-belge et comics
+  "dargaud", "dupuis", "le lombard", "lombard", "casterman", "delcourt", "soleil", "bamboo", "grand angle", "futuropolis", "rue de sevres",
+  "humanoides associes", "les humanoides associes", "vents d ouest", "fluide glacial", "urban comics", "panini comics", "marvel", "dc comics",
+  "comics", "akileos", "glenat bd", "editions du lombard", "editions dupuis", "editions dargaud", "editions delcourt", "editions glenat",
+  "kennes", "jungle", "steinkis", "paquet", "physalis", "ankama editions", "makaka", "drakoo", "sarbacane bd", "la boite a bulles",
+];
+  const MANGA_PUB = MANGA_ONLY.concat(BD_PUB);
   function guessCategory(parts) {
     const txt = ' ' + norm(parts.filter(Boolean).join(' ')) + ' ';
     if (/ (mangas?|shonen|shounen|seinen|shojo|shoujo|josei|kodomo|webtoons?|manhwa|manhua|bandes? dessinees?|bd|comics?) /.test(txt)) return 'manga';
@@ -641,7 +660,7 @@
     classifying = true;
     try {
       // livres sans catégorie, ou sans type (manga, roman, light novel…) : détection faite par le serveur
-      const recheck = (b) => !b.recat13 && !b.catManual && b.category === 'roman' && b.format !== 'Light novel' && !LN_RE.test(b.series || '') && guessCategory([b.publisher]) === 'manga';
+      const recheck = (b) => !b.recat14 && !b.catManual && b.category === 'roman' && b.format !== 'Light novel' && !LN_RE.test(b.series || '') && guessCategory([b.publisher]) === 'manga';
       const todo = state.books.filter((b) => b.isbn && ((!b.category && !b.catTriedAt) || (!b.format && !b.fmtTriedAt) || (b.price == null && !b.priceTriedAt) || recheck(b)));
       for (let i = 0; i < todo.length; i += 6) {
         const chunk = todo.slice(i, i + 6);
@@ -649,9 +668,11 @@
         try { res = (await api('lookupMany', { isbns: chunk.map((b) => b.isbn) }, 90000)).books || {}; } catch (e) { break; }
         for (const b of chunk) {
           const f = res[b.isbn];
+          const rc = recheck(b);
           b.catTriedAt = b.fmtTriedAt = b.priceTriedAt = Date.now();
-          if (f) b.recat13 = 1;
-          if (f && f.format && (!b.format || recheck(b))) b.format = f.format;
+          if (f) b.recat14 = 1;
+          if (f && f.format && (!b.format || rc)) b.format = f.format;
+          if (f && f.genre && !b.genre) b.genre = f.genre;
           if (f && f.price && !b.price) b.price = f.price;
           // un light novel rangé avec le manga du même nom : on le met dans sa propre série « Nom (roman) »
           if (f && f.series && LN_RE.test(f.series) && b.series && !LN_RE.test(b.series) && norm(f.series.replace(LN_RE, '')) === norm(b.series)) {
@@ -1267,7 +1288,7 @@
     // « Série – Tome 3 – Sous-titre » : on garde le sous-titre à part
     const part = hasSeries ? String(b.title || '').split(/\s[–-]\s*Tome\s*\d+\s*[–-]\s*/i)[1] || '' : '';
     const name = hasSeries ? b.series : (b.title || 'Titre inconnu');
-    const chips = [b.format, b.pages ? b.pages + ' pages' : '', CATS[catOf(b)].label].filter(Boolean);
+    const chips = [b.format, b.genre, b.pages ? b.pages + ' pages' : '', CATS[catOf(b)].label].filter(Boolean);
     const added = b.addedAt ? new Date(b.addedAt).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
     const tile = (k, v) => v ? `<div class="bc-tile"><span>${k}</span><b>${v}</b></div>` : '';
     const tiles = [tile('Éditeur', esc(b.publisher)), tile('Parution', b.publishedDate ? fmtDate(b.publishedDate) : ''),
@@ -1337,6 +1358,7 @@
     onlineQ = '';
     Object.assign(b, { id: uid(), addedAt: Date.now() });
     delete b.incomplete;
+    distinctSeries(b);
     const same = b.series && !b.catManual && state.books.find((x) => x.series && norm(x.series) === norm(b.series) && x.category);
     if (same) b.category = same.category;
     if (!b.category) b.category = catOf(b);
@@ -1817,11 +1839,11 @@
     setTimeout(() => i.focus(), 100);
   }
 
-  function renderSearchResults(box, res, q) {
+  function renderSearchResults(box, res, q, onBack, title) {
     const own = ownedIsbns();
     const series = res.series || [];
     const books = (res.books || []).filter((b) => !own.has(b.isbn)); // ceux qu'on a déjà sont affichés au-dessus
-    let html = '<h3 class="as-h">À ajouter à ta bibliothèque</h3>';
+    let html = `<h3 class="as-h">${title || 'À ajouter à ta bibliothèque'}</h3>`;
     if (!series.length && !books.length) {
       box.innerHTML = html + `<p class="as-hint">Rien trouvé en ligne pour « ${esc(q)} ». Vérifie l’orthographe, ou essaie avec le nom de l’auteur.</p>`;
       return;
@@ -1831,30 +1853,31 @@
         const mine = s.vols.filter((v) => own.has(v.isbn)).length;
         return `<button class="as-row" data-as-series="${i}">${thumbHTML(s)}
           <span class="as-main"><b>${esc(s.name)}</b><span>${esc([s.publisher, s.authors].filter(Boolean).join(' · '))}</span>
-          <span class="as-meta">Série · ${s.count} tome${s.count > 1 ? 's' : ''}${mine ? ` · ${mine} chez toi` : ''}</span></span>
+          <span class="as-meta">${s.kind === 'roman' ? 'Romans' : s.format || 'Série'} · ${s.count} tome${s.count > 1 ? 's' : ''}${mine ? ` · ${mine} chez toi` : ''}</span></span>
           <span class="as-chev" aria-hidden="true">›</span></button>`;
       }).join('') + '</div>';
     }
     if (books.length) {
       html += `${series.length ? '<div class="as-gap"></div>' : ''}<div class="as-list">` + books.map((b, i) => `
         <button class="as-row" data-as-book="${i}">${thumbHTML(b)}
-          <span class="as-main"><b>${esc(b.title)}</b><span>${esc([b.authors, b.publisher, year(b.date)].filter(Boolean).join(' · '))}</span></span>
+          <span class="as-main"><b>${esc(b.title)}</b><span>${esc([b.authors, b.publisher, year(b.date)].filter(Boolean).join(' · '))}</span>${b.format ? `<span class="as-meta">${esc(b.format)}</span>` : ''}</span>
           <span class="as-add" aria-label="Ajouter">＋</span></button>`).join('') + '</div>';
     }
     box.innerHTML = html;
-    $$('[data-as-series]', box).forEach((el) => el.onclick = () => openSearchSeries(series[+el.dataset.asSeries], q));
+    $$('[data-as-series]', box).forEach((el) => el.onclick = () => openSearchSeries(series[+el.dataset.asSeries], q, onBack));
     $$('[data-as-book]', box).forEach((el) => el.onclick = () => handleCode(books[+el.dataset.asBook].isbn));
   }
 
   // Une série trouvée : tous ses tomes, à cocher puis ajouter d'un coup
-  async function openSearchSeries(s, q) {
+  async function openSearchSeries(s, q, onBack) {
     const own = ownedIsbns();
-    const ownedVols = new Set(state.books.filter((b) => norm(b.series) === norm(s.name)).map((b) => b.volume));
+    const sCat = s.kind || null;
+    const ownedVols = new Set(state.books.filter((b) => norm(b.series.replace(/\s*\([^)]*\)\s*$/, '')) === norm(s.name) && samePub(b.publisher || '', s.publisher || '') && (!sCat || catOf(b) === sCat) && !b.isbn).map((b) => b.volume));
     const isOwned = (v) => own.has(v.isbn) || ownedVols.has(v.volume);
     const picked = new Set();
     if (!s.cat) {
-      const ownedBook = state.books.find((b) => norm(b.series) === norm(s.name) && b.category);
-      s.cat = ownedBook ? ownedBook.category : LN_RE.test(s.name) ? 'roman' : (guessCategory([s.publisher, s.name]) || 'roman');
+      const ownedBook = state.books.find((b) => norm(b.series) === norm(s.name) && b.category && samePub(b.publisher || '', s.publisher || ''));
+      s.cat = s.kind || (ownedBook ? ownedBook.category : LN_RE.test(s.name) ? 'roman' : (guessCategory([s.publisher, s.name]) || 'roman'));
     }
     const draw = () => {
       const vols = s.vols;
@@ -1872,7 +1895,7 @@
         }).join('')}</div>
         ${catPickerHTML(s.cat)}
         <div class="sheet-actions"><button class="btn primary block" id="asAddSel" ${picked.size ? '' : 'disabled'}>${picked.size ? `Ajouter ${picked.size} tome${picked.size > 1 ? 's' : ''}` : 'Choisis des tomes'}</button></div>`);
-      $('#asBack').onclick = () => closeSheet();
+      $('#asBack').onclick = () => (onBack ? onBack() : closeSheet());
       if ($('#asAll')) $('#asAll').onclick = () => { const all = free.every((v) => picked.has(v.isbn)); free.forEach((v) => all ? picked.delete(v.isbn) : picked.add(v.isbn)); draw(); };
       $$('.as-vol:not([disabled])', $('#sheetBody')).forEach((el) => el.onclick = () => {
         const i = el.dataset.isbn; picked.has(i) ? picked.delete(i) : picked.add(i);
@@ -1898,6 +1921,30 @@
     if ($('#asBack')) draw();
   }
   const pubWordLocal = (p) => norm(p).split(' ').filter((w) => w.length > 2 && !['editions', 'edition', 'les', 'groupe'].includes(w))[0] || '';
+  function samePub(a, b) {
+    const wa = pubWordLocal(a), wb = pubWordLocal(b);
+    return !wa || !wb || wa === wb || (' ' + norm(a) + ' ').includes(' ' + wb + ' ') || (' ' + norm(b) + ' ').includes(' ' + wa + ' ');
+  }
+  // Même nom mais autre édition (autre éditeur) ou autre type (roman / manga) : une série à part,
+  // sinon les romans des Carnets de l'apothicaire se mélangeraient aux mangas du même nom
+  function distinctSeries(b) {
+    if (!b.series) return;
+    const same = state.books.filter((x) => x.series && norm(x.series) === norm(b.series));
+    if (!same.length) return;
+    const cat = b.category || catOf(b);
+    const ref = same[0];
+    let suffix = '';
+    if (catOf(ref) !== cat && !LN_RE.test(b.series)) suffix = cat === 'roman' ? 'roman' : 'manga';
+    else if (b.publisher && !same.some((x) => samePub(x.publisher || '', b.publisher))) {
+      const w = (b.publisher.split(/[\/,]/)[0] || '').replace(/^(éditions?|editions?|les éditions)\s+/i, '').trim();
+      suffix = w || '';
+    }
+    if (!suffix) return;
+    const name = b.series + ' (' + suffix + ')';
+    const ex = seriesList().find((x) => x.key === norm(name));
+    const old = b.series; b.series = ex ? ex.name : name;
+    if (b.title && b.title.startsWith(old) && !b.title.startsWith(b.series)) b.title = b.series + b.title.slice(old.length);
+  }
 
   async function addManyIsbns(vols, s) {
     let done = 0, cancelled = false;
@@ -1928,6 +1975,11 @@
     if (added.length) {
       const fmt = (added.find((b) => b.category === s.cat && b.format) || {}).format;
       added.forEach((b) => { const was = b.category; applyCat(b, s.cat, !!s.catTouched); if (fmt && was !== s.cat) b.format = fmt; });
+      const others = state.books.filter((x) => !added.includes(x));
+      const keep = state.books; state.books = others;
+      const probe = Object.assign({}, added[0]); distinctSeries(probe);
+      state.books = keep;
+      if (probe.series !== added[0].series) { const old = added[0].series; added.forEach((b) => { if (b.series === old) { b.series = probe.series; if (b.title && b.title.startsWith(old)) b.title = probe.series + b.title.slice(old.length); } }); }
     }
     seriesCatCache = null; onlineQ = '';
     if (added.length && catOf(added[0]) !== curCat()) setCat(catOf(added[0]));
@@ -1938,6 +1990,77 @@
       <div class="sheet-actions"><button class="btn primary block" id="asAgain">Chercher un autre livre</button>
       <button class="btn ghost block" data-act="close">Terminé</button></div>`);
     $('#asAgain').onclick = () => openAddSearch('');
+  }
+
+  // ---------- Bouton « + » : scanner ou rechercher ----------
+  const ADD_ICON = {
+    scan: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 8V5h3M17 5h3v3M20 16v3h-3M7 19H4v-3M8 9v6M11 9v6M14 9v6M17 9v6"/></svg>',
+    search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5M8 11h6M11 8v6"/></svg>',
+  };
+  function openAddMenu() {
+    openSheet(`<h2>Ajouter un livre</h2>
+      <div class="add-opts">
+        <button class="add-opt" id="amScan"><span class="add-ic">${ADD_ICON.scan}</span><span><b>Scanner le code-barres</b><small>Le plus rapide : vise le dos du livre</small></span></button>
+        <button class="add-opt" id="amSearch"><span class="add-ic">${ADD_ICON.search}</span><span><b>Rechercher un livre</b><small>Par titre, auteur, éditeur, tome, type…</small></span></button>
+      </div>
+      <div class="add-more"><button class="btn ghost" id="amIsbn">Saisir un ISBN</button><button class="btn ghost" id="amHand">Saisir à la main</button></div>
+      <button class="btn ghost block" data-act="close" style="margin-top:6px">Fermer</button>`);
+    $('#amScan').onclick = () => { closeSheet(); startScan(); };
+    $('#amSearch').onclick = () => openAdvancedSearch();
+    $('#amIsbn').onclick = () => askIsbn();
+    $('#amHand').onclick = () => { closeSheet(); $('#manualBookBtn').click(); };
+  }
+
+  const FORMATS = ['Manga', 'Manhwa', 'Manhua', 'Webtoon', 'BD', 'Comics', 'Roman', 'Light novel'];
+  let advLast = { q: '', author: '', publisher: '', volume: '', category: '', format: '' };
+  const advCache = new Map();
+  async function advSearch(p) {
+    const k = JSON.stringify(p);
+    if (advCache.has(k)) return advCache.get(k);
+    const r = await api('search', Object.assign({ adv: true }, p), 45000);
+    advCache.set(k, r);
+    return r;
+  }
+  function openAdvancedSearch(prev) {
+    const v = Object.assign({}, advLast, prev || {});
+    const seg = (name, cur, opts) => `<div class="adv-seg" role="radiogroup">${opts.map(([val, lab]) => `<button type="button" role="radio" data-seg="${name}" data-val="${val}" class="${val === cur ? 'on' : ''}" aria-checked="${val === cur}">${lab}</button>`).join('')}</div>`;
+    openSheet(`<h2>Rechercher un livre</h2>
+      <form class="adv" id="advForm" autocomplete="off">
+        <label>Titre ou série<input type="search" name="q" value="${esc(v.q)}" placeholder="ex. Les carnets de l'apothicaire" enterkeyhint="search"></label>
+        <div class="adv-two">
+          <label>Auteur<input type="text" name="author" value="${esc(v.author)}" placeholder="ex. Hirano"></label>
+          <label>Éditeur<input type="text" name="publisher" value="${esc(v.publisher)}" placeholder="ex. Ki-oon"></label>
+        </div>
+        <div class="adv-two">
+          <label>Tome n°<input type="number" name="volume" min="1" inputmode="numeric" value="${esc(v.volume)}" placeholder="tous"></label>
+          <label>Type<select name="format"><option value="">Tous les types</option>${FORMATS.map((f) => `<option ${f === v.format ? 'selected' : ''}>${f}</option>`).join('')}</select></label>
+        </div>
+        <div class="adv-row"><span>Catégorie</span>${seg('category', v.category, [['', 'Tout'], ['manga', 'Mangas'], ['roman', 'Romans']])}</div>
+        <button class="btn primary block" type="submit">Rechercher</button>
+      </form>
+      <div id="advResults"></div>`);
+    let cat = v.category;
+    $$('[data-seg="category"]', $('#sheetBody')).forEach((el) => el.onclick = () => {
+      cat = el.dataset.val;
+      $$('[data-seg="category"]', $('#sheetBody')).forEach((x) => { x.classList.toggle('on', x === el); x.setAttribute('aria-checked', x === el); });
+    });
+    const run = async () => {
+      const f = new FormData($('#advForm'));
+      const p = { q: String(f.get('q') || '').trim(), author: String(f.get('author') || '').trim(), publisher: String(f.get('publisher') || '').trim(),
+        volume: String(f.get('volume') || '').trim(), category: cat, format: String(f.get('format') || '') };
+      advLast = p;
+      const box = $('#advResults');
+      if (norm(p.q).length < 2 && norm(p.author).length < 2 && norm(p.publisher).length < 2) { box.innerHTML = '<p class="as-hint">Remplis au moins le titre, l’auteur ou l’éditeur.</p>'; return; }
+      box.innerHTML = '<div class="as-loading"><span class="mini-spin"></span>Recherche chez les libraires…</div>';
+      try {
+        const res = await advSearch(Object.assign({}, p, { volume: p.volume ? +p.volume : '' }));
+        if (!$('#advResults')) return;
+        renderSearchResults($('#advResults'), res, p.q || p.author || p.publisher, () => openAdvancedSearch(advLast), 'Résultats');
+        if ($('#advResults')) $('#advResults').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (e) { if ($('#advResults')) $('#advResults').innerHTML = '<p class="as-hint">Pas de connexion. Réessaie dans un instant.</p>'; }
+    };
+    $('#advForm').addEventListener('submit', (e) => { e.preventDefault(); document.activeElement && document.activeElement.blur(); run(); });
+    if (prev) run(); else setTimeout(() => { const i = $('#advForm [name=q]'); i && i.focus(); }, 150);
   }
 
   // Contrôle du code EAN-13 : évite les lectures erronées du scanner
@@ -2019,6 +2142,18 @@
   function hashStr(str) { let h = 5381; for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0; return (h >>> 0).toString(36) + '.' + str.length.toString(36); }
   const bookHash = (b) => { const { updatedAt, ...rest } = b; return hashStr(JSON.stringify(rest)); };
   let syncTimer = null, syncing = false, syncAgain = false;
+  // Dernière version de chaque livre reçue du serveur : sert à n'envoyer que les champs modifiés ici
+  // (sinon un 2e appareil pouvait renvoyer tout le livre et écraser un changement fait ailleurs, ex. Romans / Mangas)
+  const BASE_KEY = 'mabiblio.base';
+  let syncBase = null;
+  function loadBase() { if (!syncBase) { try { syncBase = JSON.parse(localStorage.getItem(BASE_KEY) || '{}'); } catch (e) { syncBase = {}; } } return syncBase; }
+  function saveBase() { try { localStorage.setItem(BASE_KEY, JSON.stringify(syncBase || {})); } catch (e) { /* trop gros : on garde la synchro complète */ } }
+  function bookPatch(b, base) {
+    const patch = {}, unset = [];
+    for (const k of Object.keys(b)) { if (k === 'updatedAt' || k === 'id') continue; if (JSON.stringify(b[k]) !== JSON.stringify(base[k])) patch[k] = b[k]; }
+    for (const k of Object.keys(base)) if (!(k in b) && k !== 'updatedAt' && k !== 'id') unset.push(k);
+    return { patch, unset };
+  }
   function scheduleSync(ms = 2500) { clearTimeout(syncTimer); syncTimer = setTimeout(() => syncNow().catch(() => {}), ms); }
   async function ensureLibrary() {
     if (!state.sync) state.sync = {};
@@ -2036,8 +2171,14 @@
       const now = Date.now();
       const local = new Map(state.books.map((b) => [b.id, b]));
       const changes = [];
+      const base = loadBase();
       for (const b of state.books) {
-        if (snap[b.id] !== bookHash(b)) { b.updatedAt = now; changes.push({ book_id: b.id, updated_at: now, data: b }); }
+        if (snap[b.id] === bookHash(b)) continue;
+        b.updatedAt = now;
+        if (base[b.id]) {
+          const { patch, unset } = bookPatch(b, base[b.id]);
+          if (Object.keys(patch).length || unset.length) changes.push({ book_id: b.id, updated_at: now, patch, unset });
+        } else changes.push({ book_id: b.id, updated_at: now, data: b });
       }
       for (const id of Object.keys(snap)) if (!local.has(id)) changes.push({ book_id: id, deleted: true, updated_at: now });
       const r = await api('sync', { id: state.sync.id, secret: state.sync.secret, changes }, 60000);
@@ -2049,14 +2190,17 @@
           continue;
         }
         if (!row.data) continue;
+        base[row.book_id] = Object.assign({}, row.data); delete base[row.book_id].updatedAt;
         if (!loc) { state.books.push(Object.assign({}, row.data, { id: row.book_id, updatedAt: row.updated_at })); changed = true; }
-        else if (row.updated_at > (loc.updatedAt || 0)) {
+        else if (row.updated_at >= (loc.updatedAt || 0) && JSON.stringify(Object.assign({}, row.data, { id: loc.id, updatedAt: 0 })) !== JSON.stringify(Object.assign({}, loc, { updatedAt: 0 }))) {
           for (const k of Object.keys(loc)) delete loc[k];
           Object.assign(loc, row.data, { id: row.book_id, updatedAt: row.updated_at }); changed = true;
         }
       }
       const newSnap = {};
       for (const b of state.books) newSnap[b.id] = bookHash(b);
+      for (const id of Object.keys(base)) if (!local.has(id) && !state.books.some((x) => x.id === id)) delete base[id];
+      saveBase();
       state.sync.snap = newSnap; state.sync.last = Date.now(); state.sync.error = '';
       saveLocal();
       if (changed) scheduleRender();
@@ -2238,7 +2382,7 @@
   // ---------- Événements ----------
   function wire() {
     $$('.tab').forEach((t) => t.addEventListener('click', () => show(t.dataset.view)));
-    $('#scanBtn').addEventListener('click', startScan);
+    $('#scanBtn').addEventListener('click', openAddMenu);
     let qt; $('#searchInput').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(renderLibrary, 120); });
     $('#catSwitch').addEventListener('click', (e) => { const b = e.target.closest('[data-cat]'); if (b) setCat(b.dataset.cat); });
     $('#sortBtn').addEventListener('click', openSortMenu);

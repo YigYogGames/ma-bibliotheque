@@ -11,7 +11,7 @@ const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SE
   auth: { persistSession: false },
 });
 const GKEY = Deno.env.get("GOOGLE_BOOKS_KEY") || "";
-const CACHE_V = 9; // à augmenter quand la façon de lire les catalogues change
+const CACHE_V = 10; // à augmenter quand la façon de lire les catalogues change
 const clean = (b: any) => { if (!b) return b; const { _m, ...rest } = b; return rest; };
 
 const CORS = {
@@ -72,7 +72,7 @@ const LN_SUFFIX = " (roman)";
 const LN_RE = /\s*\(roman\)\s*$/i;
 const baseName = (s: string) => String(s || "").replace(LN_RE, "");
 const ASIAN = ["jpn", "kor", "chi", "zho"];
-const isMangaPub = (p: string) => { const t = " " + norm(p) + " "; return MANGA_PUB.some((x) => t.includes(" " + x + " ")); };
+const isMangaPub = (p: string) => { const t = " " + norm(p) + " "; return MANGA_ONLY.some((x) => t.includes(" " + x + " ")); };
 
 type Book = {
   isbn: string; title: string; authors: string; publisher: string; publishedDate: string;
@@ -274,6 +274,23 @@ async function imgInfo(url: string) {
   } catch { return { size: 0, w: 0, hash: "" }; }
 }
 const imgSize = async (url: string) => (await imgInfo(url)).size;
+async function headSize(url: string) {
+  try {
+    const r = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(6000), headers: { "User-Agent": UA["User-Agent"] } });
+    if (!r.ok || !(r.headers.get("content-type") || "").startsWith("image")) return 0;
+    return +(r.headers.get("content-length") || 0) || 0;
+  } catch { return 0; }
+}
+// BDfugue (librairie BD / manga) : grande couverture directement par l'ISBN ; son image « pas de couverture » fait ~4 Ko
+const bdfugueUrl = (isbn: string) => "https://www.bdfugue.com/media/catalog/product/" + isbn[0] + "/" + isbn[1] + "/" + isbn + "_1_75.jpg";
+const amazonDirect = (isbn: string) => { const i10 = isbn13to10(isbn); return i10 ? "https://images-na.ssl-images-amazon.com/images/P/" + i10 + ".01.LZZZZZZZ.jpg" : ""; };
+async function quickCover(isbn: string) {
+  const a = amazonDirect(isbn);
+  if (a && (await headSize(a)) > 1500) return a;
+  const b = bdfugueUrl(isbn);
+  if ((await headSize(b)) > 8000) return b;
+  return "";
+}
 // Images « pas de couverture » déjà repérées (Google en a plusieurs versions)
 const FAKE = new Set(["ba8cd5043eed", "f3426f39acd1"]);
 const fakeProbe: Record<string, Promise<void>> = {};
@@ -339,7 +356,10 @@ async function findCover(isbn: string, ark?: string, hint?: any) {
   // 1) Amazon
   const amz = await amazonPick(isbn, hint).catch(() => "");
   if (amz) return amz;
-  // 2) Decitre (image par ISBN, bonne qualité)
+  // 2) BDfugue
+  const bdf = bdfugueUrl(isbn);
+  if ((await headSize(bdf)) > 8000) return bdf;
+  // 3) Decitre (image par ISBN, bonne qualité)
   const dec = "https://products-images.di-static.com/image/x/" + isbn + "-475x500-1.jpg";
   if (await okImage(dec)) return dec;
   // 3) Leslibraires
@@ -443,14 +463,36 @@ async function srcDecitre(isbn: string) {
 }
 
 // ---------- Catégorie : roman ou manga (les BD et comics vont avec les mangas) ----------
-const MANGA_PUB = ["pika", "kana", "ki oon", "kioon", "kurokawa", "tonkam", "kaze", "doki doki", "akata", "soleil manga", "crunchyroll",
-  "noeve", "mangetsu", "meian", "glenat manga", "panini manga", "black box", "ototo", "taifu", "nobi nobi", "kbooks", "sakka", "naban",
-  "isan manga", "omake", "lezard noir", "imho", "vega", "dupuis manga", "kotoji", "hikari", "komikku", "mana books", "h2t", "shiba",
-  "bamboo manga", "michel lafon manga", "nazca", "delcourt tonkam", "ankama", "casterman sakka", "fleurus manga", "rue de sevres manga",
-  "ofelbe", "lanovel"];
+// Éditeurs et labels de mangas, manhwas, webtoons, BD et comics (tout va dans « Mangas »)
+const MANGA_ONLY = [
+  // mangas
+  "pika", "kana", "ki oon", "kioon", "kurokawa", "tonkam", "kaze", "doki doki", "akata", "soleil manga", "crunchyroll", "noeve", "noeve grafx",
+  "mangetsu", "meian", "glenat manga", "glenat", "panini manga", "black box", "ototo", "taifu", "nobi nobi", "kbooks", "sakka", "naban",
+  "isan manga", "omake", "lezard noir", "imho", "vega", "vega dupuis", "dupuis manga", "kotoji", "hikari", "komikku", "mana books", "h2t", "shiba",
+  "bamboo manga", "doki", "michel lafon manga", "nazca", "delcourt tonkam", "ankama", "casterman sakka", "fleurus manga", "rue de sevres manga",
+  "kazoku", "ynnis", "boy s love", "hana", "hana collection", "idp", "taifu yaoi", "boys love", "ecchi", "hot manga", "tonkam yaoi", "asuka",
+  "pika graphic", "kurokawa kids", "glenat jeunesse manga", "akileos manga", "dynamite", "j ai lu manga", "milan manga", "nobi", "makma",
+  "kana dark", "kioon kids", "soleil manga seinen", "kaze manga", "delcourt manga",
+  // manhwas, webtoons
+  "delitoon", "webtoon factory", "kotoon", "michel lafon webtoon", "piccoma", "kbooks webtoon", "verytoon", "toomics",
+];
+const BD_PUB = [
+  // BD franco-belge et comics
+  "dargaud", "dupuis", "le lombard", "lombard", "casterman", "delcourt", "soleil", "bamboo", "grand angle", "futuropolis", "rue de sevres",
+  "humanoides associes", "les humanoides associes", "vents d ouest", "fluide glacial", "urban comics", "panini comics", "marvel", "dc comics",
+  "comics", "akileos", "glenat bd", "editions du lombard", "editions dupuis", "editions dargaud", "editions delcourt", "editions glenat",
+  "kennes", "jungle", "steinkis", "paquet", "physalis", "ankama editions", "makaka", "drakoo", "sarbacane bd", "la boite a bulles",
+];
+const MANGA_PUB = MANGA_ONLY.concat(BD_PUB);
+const COMICS_PUB = ["urban comics", "panini comics", "marvel", "dc comics", "comics", "delcourt comics", "hicomics"];
+// éditeurs qui font autant de BD que de mangas : on ne devine pas le type à partir du seul nom
+const MIXED_PUB = ["delcourt", "casterman", "soleil", "dupuis", "glenat", "dargaud", "ankama", "bamboo", "panini"];
+const pubIn = (list: string[], p: string) => { const t = " " + norm(p) + " "; return list.some((x) => t.includes(" " + x + " ")); };
+// Éditeurs de light novels (romans japonais / coréens) : rangés dans Romans
+const LN_PUB = ["ofelbe", "lanovel", "kurokawa light novel", "pika roman", "kbooks roman", "lumen", "akata roman", "meian roman", "noeve light novel"];
 function categorize(parts: any[]): string {
   const txt = " " + norm(parts.flat().filter(Boolean).join(" ")) + " ";
-  if (/ (mangas?|shonen|shounen|seinen|shojo|shoujo|josei|kodomo|webtoons?|manhwa|manhua|bandes? dessinees?|bd|comics?|graphic novels?|comic books?) /.test(txt)) return "manga";
+  if (/ (mangas?|shonen|shounen|seinen|shojo|shoujo|josei|kodomo|kodomomuke|isekai|yaoi|yuri|boys? love|bl|girls? love|ecchi|hentai|seijin|webtoons?|manhwas?|manhuas?|bandes? dessinees?|bd|comics?|graphic novels?|comic books?|roman graphique|romans graphiques|album jeunesse bd|humour bd|strip|fumetti) /.test(txt)) return "manga";
   if (MANGA_PUB.some((p) => txt.includes(" " + p + " "))) return "manga";
   return "roman";
 }
@@ -520,7 +562,7 @@ async function lookup(isbn: string) {
   const kind = (weakRoman ? "" : bnf?.kind) || (saysNovel ? "roman" : "");
   b.category = kind || categorize([found.map((f: any) => [f.subjects, f.collection]), b.publisher, b.collection]);
   const origLang = bnf?.origLang || ll?.origLang || "";
-  const light = b.category === "roman" && (bnf?.light || / light novel /.test(titlesTxt + norm(b.collection) + " ") ||
+  const light = b.category === "roman" && (bnf?.light || / light novel /.test(titlesTxt + norm(b.collection) + " ") || LN_PUB.some((x) => (" " + norm(b.publisher) + " ").includes(" " + x + " ")) ||
     (isMangaPub(b.publisher) && (saysNovel || ASIAN.includes(origLang))));
   if (!light && LN_RE.test(b.series || "")) { // la BnF avait cru à un light novel
     b.series = baseName(b.series);
@@ -530,11 +572,18 @@ async function lookup(isbn: string) {
     b.series = baseName(b.series) + LN_SUFFIX;
     if (b.volume) b.title = b.series + " – Tome " + b.volume;
   }
+  const gTxt = " " + norm([found.map((f: any) => [f.subjects, f.collection, f.title]), b.collection, b.publisher].flat(3).filter(Boolean).join(" ")) + " ";
+  b.genre = / (hentai|seijin|adult) /.test(gTxt) ? "Hentai" : / ecchi /.test(gTxt) ? "Ecchi" : / (yaoi|boys? love|bl) /.test(gTxt) ? "Boys love"
+    : / (yuri|girls? love) /.test(gTxt) ? "Yuri" : / (shojo|shoujo) /.test(gTxt) ? "Shōjo" : / josei /.test(gTxt) ? "Josei" : / seinen /.test(gTxt) ? "Seinen"
+    : / (shonen|shounen) /.test(gTxt) ? "Shōnen" : / (kodomo|kids|jeunesse) /.test(gTxt) && b.category === "manga" ? "Kodomo" : / isekai /.test(gTxt) ? "Isekai" : "";
+  const webtoon = / (webtoons?|delitoon|kotoon|piccoma|verytoon|toomics) /.test(gTxt);
   b.format = light ? "Light novel" : b.category === "roman" ? "Roman"
+    : webtoon ? "Webtoon" : origLang === "chi" || origLang === "zho" || / manhua /.test(gTxt) ? "Manhua"
     : origLang === "kor" ? "Manhwa" : (ASIAN.includes(origLang) || isMangaPub(b.publisher)) ? "Manga"
-    : / comics? /.test(" " + norm(JSON.stringify(found.map((f: any) => f.subjects || []))) + " ") ? "Comics" : "BD";
+    : pubIn(COMICS_PUB, b.publisher) || / comics? /.test(" " + norm(JSON.stringify(found.map((f: any) => f.subjects || []))) + " ") ? "Comics" : "BD";
   // couverture : Amazon d'abord, puis Leslibraires, Decitre, BnF et les autres (chaque image est vérifiée)
   b.cover = await amazonPick(isbn, { title: b.title, series: b.series, volume: b.volume }, amzCands).catch(() => "");
+  if (!b.cover && (await headSize(bdfugueUrl(isbn))) > 8000) b.cover = bdfugueUrl(isbn);
   if (!b.cover) {
     const cands = [ll?.cover, "https://products-images.di-static.com/image/x/" + isbn + "-475x500-1.jpg", bnf?.cover, pdl?.cover, gg?.cover, pickAll("cover")].filter(Boolean);
     for (const c of [...new Set(cands)]) { if (await okImage(c)) { b.cover = c; break; } }
@@ -904,19 +953,28 @@ async function seriesInfo(name: string, books: any[]) {
 // ---------- Recherche par titre (ajout sans code-barres) ----------
 // « solo » -> Solo Leveling (regroupé en série, tous les tomes trouvés), puis les autres livres dont le titre contient « solo »
 const SEARCH_TTL = 864e5;
-async function searchBooks(raw: string) {
+const SEARCH_V = 3; // version des résultats en mémoire
+async function searchBooks(input: any) {
+  // recherche simple (texte) ou avancée : titre, auteur, éditeur, tome, catégorie (roman / manga), type (Manga, Manhwa, BD…)
+  const P = typeof input === "string" ? { q: input } : (input || {});
+  const raw = String(P.q || "").trim();
   const q = norm(raw).slice(0, 60);
-  const words = q.split(" ").filter(Boolean);
-  if (!words.length || q.length < 2) return { series: [], books: [] };
-  const key = "search|" + q;
+  const au = norm(P.author || "").slice(0, 60), pubQ = norm(P.publisher || "").slice(0, 60);
+  const volQ = +P.volume || 0, catQ = P.category === "roman" || P.category === "manga" ? P.category : "", fmtQ = String(P.format || "");
+  const words = q.split(" ").filter(Boolean), aWords = au.split(" ").filter(Boolean), pWords = pubQ.split(" ").filter(Boolean);
+  if (q.length < 2 && au.length < 2 && pubQ.length < 2) return { series: [], books: [] };
+  const key = "search" + SEARCH_V + "|" + [q, au, pubQ, volQ || "", catQ, fmtQ].join("|").replace(/\|+$/, "");
   const { data: c } = await db.from("series_cache").select("data, checked_at").eq("key", key).maybeSingle();
   if (c && Date.now() - new Date(c.checked_at).getTime() < SEARCH_TTL) return c.data;
   // chaque mot tapé doit être le début d'un mot du titre (« sol » trouve « Solo », pas « Consolation »)
   const matches = (t: string) => { const n = " " + norm(t) + " "; return words.every((w) => n.includes(" " + w)); };
+  const hasAll = (t: string, ws: string[]) => { const n = " " + norm(t) + " "; return ws.every((w) => n.includes(" " + w)); };
   const found: any[] = [];
   const add = (r: any, src: string, rank: number) => {
     if (!r || !r.isbn || !/^97[89]\d{10}$/.test(r.isbn) || !r.title) return;
     if (!matches(r.title) && !matches(r.series || "")) return;
+    if (aWords.length && !hasAll(r.authors || "", aWords)) return;
+    if (pWords.length && !hasAll(r.publisher || "", pWords)) return;
     found.push({ isbn: r.isbn, title: r.title, authors: r.authors || "", publisher: r.publisher || "", date: r.date || r.publishedDate || "",
       cover: r.cover || "", series: r.series || "", volume: r.volume || null, src, rank });
   };
@@ -925,7 +983,8 @@ async function searchBooks(raw: string) {
   tasks.push((async () => {
     for (const page of [1, 2]) {
       try {
-        const r = await hostLimited("pdl", () => placeDesLibraires(raw, "&page=" + page), 1200);
+        const adv = au || pubQ ? "&form_recherche_avancee=ok" + (au ? "&auteurs=" + encodeURIComponent(P.author) : "") + (pubQ ? "&editeur=" + encodeURIComponent(P.publisher) : "") : "";
+        const r = await hostLimited("pdl", () => placeDesLibraires(raw, adv + "&page=" + page), 1200);
         r.forEach((x, i) => add(x, "pdl", (page - 1) * 30 + i));
         if (r.length < 20) break; // pas de page suivante
       } catch { break; }
@@ -934,14 +993,16 @@ async function searchBooks(raw: string) {
   // Google Books
   tasks.push((async () => {
     try {
-      const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent("intitle:" + raw) + "&maxResults=40&printType=books&langRestrict=fr"), 9000), 2);
+      const gq = [raw ? "intitle:" + raw : "", au ? "inauthor:" + P.author : "", pubQ ? "inpublisher:" + P.publisher : ""].filter(Boolean).join(" ");
+      const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent(gq) + "&maxResults=40&printType=books&langRestrict=fr"), 9000), 2);
       (d.items || []).forEach((it: any, i: number) => { const b = fromGoogle(it); add(b, "google", 20 + i); });
     } catch { /* sans Google */ }
   })());
   // Mémoire du serveur (livres déjà scannés par quelqu'un) : marche aussi avec un début de mot
   tasks.push((async () => {
     try {
-      const { data } = await db.from("book_cache").select("isbn, data").eq("found", true).ilike("data->>title", "%" + words[0].replace(/[%_]/g, "") + "%").limit(80);
+      const [col, w] = words.length ? ["data->>title", words[0]] : aWords.length ? ["data->>authors", aWords[0]] : ["data->>publisher", pWords[0]];
+      const { data } = await db.from("book_cache").select("isbn, data").eq("found", true).ilike(col, "%" + w.replace(/[%_]/g, "") + "%").limit(80);
       (data || []).forEach((r: any, i: number) => add({ ...r.data, isbn: r.isbn }, "cache", 10 + i));
     } catch { /* rien */ }
   })());
@@ -962,28 +1023,53 @@ async function searchBooks(raw: string) {
   // regroupement par série et éditeur (deux éditions = deux séries)
   const groups = new Map<string, any>();
   const books: any[] = [];
+  const fmtOf = (kind: string, pub: string) => kind === "roman" ? (pubIn(LN_PUB, pub) ? "Light novel" : "Roman") : pubIn(COMICS_PUB, pub) ? "Comics" : pubIn(MIXED_PUB, pub) ? "" : pubIn(BD_PUB, pub) && !isMangaPub(pub) ? "BD"
+    : / (delitoon|kotoon|webtoon|piccoma|verytoon|toomics) /.test(" " + norm(pub) + " ") ? "Webtoon" : / kbooks /.test(" " + norm(pub) + " ") ? "Manhwa" : kind === "manga" ? "Manga" : "";
   for (const r of byIsbn.values()) {
+    // romans et mangas du même nom, même chez le même éditeur : deux séries différentes
+    const rk = / (roman|romans|light novel|novel) /.test(" " + norm(r.title) + " ") || pubIn(LN_PUB, r.publisher) ? "roman"
+      : (isMangaPub(r.publisher) || pubIn(BD_PUB, r.publisher)) ? "manga" : "";
+    r.kind = rk; r.format = fmtOf(rk, r.publisher);
     if (!r.series || !r.volume) { books.push(r); continue; }
     const pw = pubWord(r.publisher);
-    const k = norm(r.series) + "|" + pw;
+    const k = norm(r.series) + "|" + pw + "|" + (rk === "roman" ? "roman" : "");
     // un livre sans éditeur rejoint la série du même nom déjà vue
     const g = groups.get(k) || (!pw ? [...groups.values()].find((x) => x.key === norm(r.series)) : null);
-    if (g) { if (!g.vols.some((v: any) => v.volume === r.volume)) g.vols.push(r); g.rank = Math.min(g.rank, r.rank); if (!g.publisher) g.publisher = r.publisher; }
-    else groups.set(k, { key: norm(r.series), name: r.series, publisher: r.publisher, rank: r.rank, vols: [r] });
+    if (g) { if (!g.vols.some((v: any) => v.volume === r.volume)) g.vols.push(r); g.rank = Math.min(g.rank, r.rank); if (!g.publisher) g.publisher = r.publisher; if (!g.kind) g.kind = rk; }
+    else groups.set(k, { key: norm(r.series), name: r.series, publisher: r.publisher, rank: r.rank, vols: [r], kind: rk });
   }
   const series = [...groups.values()].map((g) => {
     g.vols.sort((a: any, b: any) => a.volume - b.volume);
     const v1 = g.vols.find((v: any) => v.cover) || g.vols[0];
-    return { name: g.name, publisher: g.publisher, authors: v1.authors, cover: v1.cover, count: g.vols.length, maxVol: g.vols[g.vols.length - 1].volume, rank: g.rank,
+    const fmt = fmtOf(g.kind, g.publisher);
+    return { name: g.name, publisher: g.publisher, authors: v1.authors, cover: v1.cover, count: g.vols.length, maxVol: g.vols[g.vols.length - 1].volume, rank: g.rank, kind: g.kind || "", format: fmt,
       vols: g.vols.map((v: any) => ({ isbn: v.isbn, volume: v.volume, title: v.title, cover: v.cover, date: v.date })) };
   });
   // une « série » d'un seul tome isolé reste dans les livres
-  const real = series.filter((s) => s.count > 1 || s.maxVol > 1);
-  for (const s of series) if (!real.includes(s)) books.push({ ...s.vols[0], publisher: s.publisher, authors: s.authors, series: s.name, volume: s.vols[0].volume });
-  const starts = (t: string) => norm(t).startsWith(q) ? 0 : 1;
+  let real = series.filter((s) => s.count > 1 || s.maxVol > 1);
+  for (const s of series) if (!real.includes(s)) books.push({ ...s.vols[0], publisher: s.publisher, authors: s.authors, series: s.name, volume: s.vols[0].volume, kind: s.kind, format: s.format });
+  const okKind = (k: string) => !catQ || !k || k === catQ;
+  const okFmt = (f: string) => !fmtQ || !f || f === fmtQ;
+  real = real.filter((s) => okKind(s.kind) && okFmt(s.format));
+  if (volQ) real = real.map((s) => ({ ...s, vols: s.vols.filter((v: any) => v.volume === volQ) })).filter((s) => s.vols.length).map((s) => ({ ...s, count: s.vols.length }));
+  for (let i = books.length - 1; i >= 0; i--) { const b = books[i]; if (!okKind(b.kind) || !okFmt(b.format) || (volQ && b.volume !== volQ)) books.splice(i, 1); }
+  const starts = (t: string) => q && norm(t).startsWith(q) ? 0 : 1;
   real.sort((a, b) => starts(a.name) - starts(b.name) || b.count - a.count || a.rank - b.rank);
   books.sort((a, b) => starts(a.title) - starts(b.title) || a.rank - b.rank);
   const out = { series: real.slice(0, 12), books: books.slice(0, 30).map(({ rank, src, ...r }) => r) };
+  const items: any[] = [...out.series.flatMap((x: any) => x.vols), ...out.books].slice(0, 140);
+  const work = items.slice();
+  const worker = async () => {
+    while (work.length) {
+      const it = work.shift();
+      if (it.cover && !/epagine/.test(it.cover)) continue; // déjà une couverture vérifiée (mémoire du serveur)
+      const q = await quickCover(it.isbn);
+      if (q) it.cover = q;
+      else if (it.cover && !(await okImage(it.cover))) it.cover = "";
+    }
+  };
+  await Promise.all(Array.from({ length: 12 }, worker));
+  for (const x of out.series as any[]) { const v1 = x.vols.find((v: any) => v.cover); x.cover = v1 ? v1.cover : ""; }
   out.series.forEach((s: any) => delete s.rank);
   if (found.length) await db.from("series_cache").upsert({ key, data: out, checked_at: new Date().toISOString() });
   return out;
@@ -1005,14 +1091,26 @@ async function auth(id: string, secret: string) {
 async function sync(id: string, changes: any[]) {
   if (Array.isArray(changes) && changes.length) {
     const ids = changes.map((c) => String(c.book_id));
-    const existing = new Map<string, number>();
+    const existing = new Map<string, any>();
     for (let i = 0; i < ids.length; i += 200) {
-      const { data } = await db.from("library_books").select("book_id, updated_at").eq("library_id", id).in("book_id", ids.slice(i, i + 200));
-      for (const r of data || []) existing.set(r.book_id, Number(r.updated_at));
+      const { data } = await db.from("library_books").select("book_id, updated_at, data, deleted").eq("library_id", id).in("book_id", ids.slice(i, i + 200));
+      for (const r of data || []) existing.set(r.book_id, r);
     }
-    const rows = changes
-      .filter((c) => c && c.book_id && Number(c.updated_at) > (existing.get(String(c.book_id)) ?? -1))
-      .map((c) => ({ library_id: id, book_id: String(c.book_id), data: c.deleted ? null : c.data, deleted: !!c.deleted, updated_at: Number(c.updated_at) }));
+    const rows: any[] = [];
+    for (const c of changes) {
+      if (!c || !c.book_id) continue;
+      const ex = existing.get(String(c.book_id));
+      const exAt = ex ? Number(ex.updated_at) : -1;
+      if (c.patch) {
+        // seulement les champs modifiés sur cet appareil : les autres changements (faits ailleurs) sont conservés
+        if (ex && ex.deleted && exAt > Number(c.updated_at)) continue;
+        const data = { ...((ex && ex.data) || {}), ...c.patch };
+        for (const k of c.unset || []) delete data[k];
+        rows.push({ library_id: id, book_id: String(c.book_id), data, deleted: false, updated_at: Math.max(exAt, Number(c.updated_at)) });
+      } else if (Number(c.updated_at) > exAt) {
+        rows.push({ library_id: id, book_id: String(c.book_id), data: c.deleted ? null : c.data, deleted: !!c.deleted, updated_at: Number(c.updated_at) });
+      }
+    }
     for (let i = 0; i < rows.length; i += 300) {
       const { error } = await db.from("library_books").upsert(rows.slice(i, i + 300));
       if (error) throw new Error(error.message);
@@ -1054,7 +1152,7 @@ Deno.serve(async (req) => {
       }
       return json({ cover });
     }
-    if (action === "search") return json(await searchBooks(String(body.q || "")));
+    if (action === "search") return json(await searchBooks(body.adv ? body : String(body.q || "")));
     if (action === "seriesInfo") return json({ info: await seriesInfo(String(body.series || ""), Array.isArray(body.books) ? body.books.slice(0, 300) : []) });
     if (action === "volumes") return json({ volumes: await volumes(String(body.series || ""), (body.volumes || []).map(Number).filter((n: number) => n > 0), String(body.publisher || ""), String(body.refIsbn || "")) });
 

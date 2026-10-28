@@ -858,3 +858,37 @@ body.sheet-open .topbar { transform-origin: 50% 35vh; }
 #refreshRelBtn svg { width: 18px; height: 18px; }
 #refreshRelBtn.spinning svg { animation: spin .9s linear infinite; }
 #refreshRelBtn:disabled { opacity: .75; }
+
+/* ===== iPhone : barre du bas, barre d'état, coins des cartes (v0.14) ===== */
+/* largeur fixe calculée (4 onglets de 48 + scanner de 56 + espaces) : plus de calcul automatique que Safari faussait */
+.tabbar { width: 300px; max-width: calc(100% - 20px); left: 0; right: 0; margin: 0 auto; transform: none; justify-content: space-between;
+  padding: 0 10px; box-sizing: border-box; }
+.tabbar > * { flex: 0 0 auto; }
+.tab { flex: 0 0 48px; min-width: 48px; }
+/* bande sous l'heure et la batterie : le contenu qui défile passe dessous au lieu de se mélanger aux icônes */
+body::after { content: ""; position: fixed; left: 0; right: 0; top: 0; height: var(--safe-top); z-index: 15; pointer-events: none;
+  background: color-mix(in srgb, var(--bg2) 82%, transparent); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
+html.scanning body::after { display: none; }
+/* Safari ne coupait pas le fond flouté aux coins arrondis pendant l'animation d'entrée */
+.s-card { -webkit-mask-image: -webkit-radial-gradient(white, black); mask-image: radial-gradient(white, black); }
+
+/* ===== Menu « + » et recherche avancée (v0.14) ===== */
+.add-opts { display: grid; gap: 10px; }
+.add-opt { display: flex; align-items: center; gap: 14px; width: 100%; padding: 16px; border-radius: 18px; border: 1px solid var(--border); background: var(--surface);
+  color: var(--text); text-align: left; font: inherit; cursor: pointer; }
+.add-opt:active { transform: scale(.98); }
+.add-opt b { display: block; font-size: 16px; }
+.add-opt small { display: block; font-size: 13px; color: var(--muted); margin-top: 2px; }
+.add-ic { width: 48px; height: 48px; flex-shrink: 0; border-radius: 14px; display: grid; place-items: center; background: var(--accent); color: var(--accent-text); }
+.add-ic svg { width: 24px; height: 24px; }
+.add-more { display: flex; justify-content: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.adv { display: grid; gap: 12px; }
+.adv label { display: grid; gap: 5px; font-size: 12.5px; font-weight: 700; color: var(--muted); min-width: 0; }
+.adv input, .adv select { width: 100%; min-width: 0; height: 44px; border-radius: 12px; font-size: 15px; }
+.adv-two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.adv-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; font-weight: 700; color: var(--muted); }
+.adv-seg { display: flex; gap: 3px; padding: 3px; border-radius: 999px; background: var(--surface2); }
+.adv-seg button { border: 0; background: none; color: var(--muted); font: inherit; font-weight: 700; font-size: 13.5px; padding: 8px 13px; border-radius: 999px; cursor: pointer; }
+.adv-seg button.on { background: var(--accent); color: var(--accent-text); }
+#advResults { margin-top: 6px; }
+#advResults .as-list { grid-template-columns: minmax(0, 1fr); }
