@@ -660,3 +660,11 @@ body::before { content: ""; position: fixed; inset: 0; z-index: -1; background: 
 html.scanning body::before { display: none; }
 /* barre du bas : centrée sans dépendre de la moitié de l'écran (sinon elle se rétrécit sur iPhone) */
 .tabbar { left: 0; right: 0; margin: 0 auto; width: max-content; max-width: calc(100% - 24px); transform: none; }
+
+/* choix Roman / Manga à l'ajout (v0.12.3) */
+.cat-pick { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; padding: 10px 12px 10px 16px;
+  border-radius: 16px; background: var(--surface); border: 1px solid var(--border); }
+.cat-pick > span { font-size: 14px; font-weight: 600; color: var(--muted); }
+.cat-seg { display: flex; gap: 4px; padding: 3px; border-radius: 999px; background: var(--surface2); }
+.cat-seg button { border: 0; background: none; color: var(--muted); font: inherit; font-weight: 600; font-size: 14px; padding: 8px 16px; border-radius: 999px; cursor: pointer; }
+.cat-seg button.on { background: var(--accent); color: var(--accent-text); }

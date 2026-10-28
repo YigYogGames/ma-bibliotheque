@@ -1155,6 +1155,7 @@
           <label>Parution<input type="text" name="publishedDate" value="${esc(b.publishedDate)}" placeholder="AAAA-MM-JJ"></label>
         </div>
         <label>ISBN<input type="text" name="isbn" inputmode="numeric" value="${esc(b.isbn)}"></label>
+        ${isNew ? catPickerHTML(detectedCat(b)) : ''}
         <div class="sheet-actions">
           <button class="btn primary block" type="submit">${isNew ? '＋ Ajouter à ma bibliothèque' : 'Enregistrer'}</button>
           ${isNew ? '<button class="btn block" type="button" data-act="scan-again">Annuler et scanner un autre</button>' : ''}
@@ -1164,6 +1165,9 @@
   }
 
   function wireBookForm(b, isNew) {
+    const cat0 = isNew ? detectedCat(b) : null;
+    let picked = cat0;
+    if (isNew) wireCatPicker((c) => { picked = c; });
     $('#bookForm').addEventListener('submit', (e) => {
       e.preventDefault();
       const f = new FormData(e.target);
@@ -1174,7 +1178,9 @@
       };
       if (!upd.title) return toast('Il faut au moins un titre');
       if (isNew) {
-        addBook(Object.assign({}, b, upd));
+        const nb = Object.assign({}, b, upd);
+        applyCat(nb, picked, picked !== cat0);
+        addBook(nb);
       } else {
         Object.assign(b, upd); delete b.incomplete; save(); closeSheet(); render(); toast('Livre complété');
       }
@@ -1215,14 +1221,43 @@
     trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>',
   };
 
+  // ---------- Choix Roman / Manga au moment de l'ajout ----------
+  // proposé d'office : la bibliothèque des autres tomes de la série, sinon ce que l'appli a détecté
+  function detectedCat(b) {
+    if (b.catManual && b.category) return b.category;
+    const same = b.series && state.books.find((x) => x.series && norm(x.series) === norm(b.series) && x.category);
+    return (same && same.category) || b.category || catOf(b);
+  }
+  function catPickerHTML(cur) {
+    return `<div class="cat-pick"><span>Ranger dans</span><div class="cat-seg" role="radiogroup">
+      ${['roman', 'manga'].map((c) => `<button type="button" role="radio" aria-checked="${c === cur}" class="${c === cur ? 'on' : ''}" data-pick="${c}">${c === 'roman' ? 'Roman' : 'Manga'}</button>`).join('')}
+      </div></div>`;
+  }
+  function wireCatPicker(onPick) {
+    $$('[data-pick]', $('#sheetBody')).forEach((el) => el.onclick = () => {
+      $$('[data-pick]', $('#sheetBody')).forEach((x) => { const on = x === el; x.classList.toggle('on', on); x.setAttribute('aria-checked', on); });
+      onPick(el.dataset.pick);
+    });
+  }
+  // la catégorie choisie à la main l'emporte, et le type affiché suit (un manga n'est pas « Roman »)
+  function applyCat(b, cat, manual = true) {
+    b.category = cat; if (manual) b.catManual = true;
+    if (cat === 'manga' && /^(Roman|Light novel)$/.test(b.format || '')) b.format = 'Manga';
+    if (cat === 'roman' && b.format && !/^(Roman|Light novel)$/.test(b.format)) b.format = 'Roman';
+  }
+
   function confirmAdd(b) {
-    openSheet(`${bookCard(b)}
+    const cat = detectedCat(b);
+    openSheet(`${bookCard(Object.assign({}, b, { category: cat }))}
+      ${catPickerHTML(cat)}
       <div class="sheet-actions">
         <button class="btn primary block" id="doAdd">＋ Ajouter à ma bibliothèque</button>
         <button class="btn block" data-act="scan-again">Ce n’est pas le bon livre, rescanner</button>
         <button class="btn ghost block" data-act="close">Annuler</button>
       </div>`);
-    $('#doAdd').onclick = () => addBook(b);
+    let picked = cat;
+    wireCatPicker((c) => { picked = c; });
+    $('#doAdd').onclick = () => { applyCat(b, picked, picked !== cat); addBook(b); };
   }
 
   function addBook(b) {
@@ -1744,6 +1779,10 @@
     const ownedVols = new Set(state.books.filter((b) => norm(b.series) === norm(s.name)).map((b) => b.volume));
     const isOwned = (v) => own.has(v.isbn) || ownedVols.has(v.volume);
     const picked = new Set();
+    if (!s.cat) {
+      const ownedBook = state.books.find((b) => norm(b.series) === norm(s.name) && b.category);
+      s.cat = ownedBook ? ownedBook.category : LN_RE.test(s.name) ? 'roman' : (guessCategory([s.publisher, s.name]) || 'roman');
+    }
     const draw = () => {
       const vols = s.vols;
       const free = vols.filter((v) => !isOwned(v));
@@ -1758,6 +1797,7 @@
             ${coverHTML({ cover: v.cover, title: v.title, series: s.name })}<span class="as-num">${v.volume}</span>
             ${o ? '<span class="as-tick own">✓</span>' : '<span class="as-tick"></span>'}</button>`;
         }).join('')}</div>
+        ${catPickerHTML(s.cat)}
         <div class="sheet-actions"><button class="btn primary block" id="asAddSel" ${picked.size ? '' : 'disabled'}>${picked.size ? `Ajouter ${picked.size} tome${picked.size > 1 ? 's' : ''}` : 'Choisis des tomes'}</button></div>`);
       $('#asBack').onclick = () => closeSheet();
       if ($('#asAll')) $('#asAll').onclick = () => { const all = free.every((v) => picked.has(v.isbn)); free.forEach((v) => all ? picked.delete(v.isbn) : picked.add(v.isbn)); draw(); };
@@ -1768,6 +1808,7 @@
         btn.textContent = picked.size ? `Ajouter ${picked.size} tome${picked.size > 1 ? 's' : ''}` : 'Choisis des tomes';
         const all = $('#asAll'); if (all) all.textContent = free.every((v) => picked.has(v.isbn)) ? 'Tout décocher' : 'Tout cocher';
       });
+      wireCatPicker((c) => { s.cat = c; s.catTouched = true; });
       $('#asAddSel').onclick = () => addManyIsbns(vols.filter((v) => picked.has(v.isbn)), s);
     };
     draw();
@@ -1812,11 +1853,8 @@
     };
     await Promise.all([worker(), worker(), worker()]);
     if (added.length) {
-      const owned = state.books.find((x) => !added.includes(x) && x.series && norm(x.series) === norm(s.name) && x.category);
-      const cnt = {}; added.forEach((b) => { cnt[b.category] = (cnt[b.category] || 0) + 1; });
-      const cat = owned ? owned.category : Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0];
-      const fmt = (added.find((b) => b.category === cat && b.format) || {}).format;
-      added.forEach((b) => { if (b.category !== cat) { b.category = cat; if (fmt) b.format = fmt; } });
+      const fmt = (added.find((b) => b.category === s.cat && b.format) || {}).format;
+      added.forEach((b) => { const was = b.category; applyCat(b, s.cat, !!s.catTouched); if (fmt && was !== s.cat) b.format = fmt; });
     }
     seriesCatCache = null; onlineQ = '';
     if (added.length && catOf(added[0]) !== curCat()) setCat(catOf(added[0]));
