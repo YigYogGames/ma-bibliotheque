@@ -5,8 +5,7 @@
 // - volumes : infos de plusieurs tomes d'une série (pour « ajouter les tomes précédents »)
 // - register / sync : sauvegarde et synchronisation de la bibliothèque
 // - releases : sorties prévues (calculées en arrière-plan, à l'ouverture de l'appli et chaque nuit)
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { createClient } from "npm:@supabase/supabase-js@2";
 
 const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, {
   auth: { persistSession: false },
@@ -611,8 +610,8 @@ const strip = (h: string) => xmlDecode(String(h).replace(/<[^>]+>/g, " ").replac
 const frenchIsbn = (i: string) => /^(9782|97910)/.test(i || "");
 
 // Place des Libraires : la recherche affiche titre, éditeur, date de parution et ISBN
-async function placeDesLibraires(query: string) {
-  const html = await getPage("https://www.placedeslibraires.fr/listeliv.php?base=allbooks&mots_recherche=" + encodeURIComponent(query), 25000);
+async function placeDesLibraires(query: string, extra = "") {
+  const html = await getPage("https://www.placedeslibraires.fr/listeliv.php?base=" + (extra ? "paper" : "allbooks") + "&mots_recherche=" + encodeURIComponent(query) + extra, 25000);
   const out: any[] = [];
   for (const block of html.split('<h2 class="livre_titre">').slice(1)) {
     const isbn = (block.match(/\/livre\/(\d{13})-/) || [])[1] || "";
@@ -892,6 +891,94 @@ async function seriesInfo(name: string, books: any[]) {
   return info;
 }
 
+// ---------- Recherche par titre (ajout sans code-barres) ----------
+// « solo » -> Solo Leveling (regroupé en série, tous les tomes trouvés), puis les autres livres dont le titre contient « solo »
+const SEARCH_TTL = 864e5;
+async function searchBooks(raw: string) {
+  const q = norm(raw).slice(0, 60);
+  const words = q.split(" ").filter(Boolean);
+  if (!words.length || q.length < 2) return { series: [], books: [] };
+  const key = "search|" + q;
+  const { data: c } = await db.from("series_cache").select("data, checked_at").eq("key", key).maybeSingle();
+  if (c && Date.now() - new Date(c.checked_at).getTime() < SEARCH_TTL) return c.data;
+  // chaque mot tapé doit être le début d'un mot du titre (« sol » trouve « Solo », pas « Consolation »)
+  const matches = (t: string) => { const n = " " + norm(t) + " "; return words.every((w) => n.includes(" " + w)); };
+  const found: any[] = [];
+  const add = (r: any, src: string, rank: number) => {
+    if (!r || !r.isbn || !/^97[89]\d{10}$/.test(r.isbn) || !r.title) return;
+    if (!matches(r.title) && !matches(r.series || "")) return;
+    found.push({ isbn: r.isbn, title: r.title, authors: r.authors || "", publisher: r.publisher || "", date: r.date || r.publishedDate || "",
+      cover: r.cover || "", series: r.series || "", volume: r.volume || null, src, rank });
+  };
+  const tasks: Promise<void>[] = [];
+  // Place des Libraires (livres papier, classés par popularité) : 2 pages
+  tasks.push((async () => {
+    for (const page of [1, 2]) {
+      try {
+        const r = await hostLimited("pdl", () => placeDesLibraires(raw, "&page=" + page), 1200);
+        r.forEach((x, i) => add(x, "pdl", (page - 1) * 30 + i));
+        if (r.length < 20) break; // pas de page suivante
+      } catch { break; }
+    }
+  })());
+  // Google Books
+  tasks.push((async () => {
+    try {
+      const d = await withRetry(() => getJSON(gUrl("q=" + encodeURIComponent("intitle:" + raw) + "&maxResults=40&printType=books&langRestrict=fr"), 9000), 2);
+      (d.items || []).forEach((it: any, i: number) => { const b = fromGoogle(it); add(b, "google", 20 + i); });
+    } catch { /* sans Google */ }
+  })());
+  // Mémoire du serveur (livres déjà scannés par quelqu'un) : marche aussi avec un début de mot
+  tasks.push((async () => {
+    try {
+      const { data } = await db.from("book_cache").select("isbn, data").eq("found", true).ilike("data->>title", "%" + words[0].replace(/[%_]/g, "") + "%").limit(80);
+      (data || []).forEach((r: any, i: number) => add({ ...r.data, isbn: r.isbn }, "cache", 10 + i));
+    } catch { /* rien */ }
+  })());
+  await Promise.all(tasks);
+  // éditions françaises seulement, si on en a
+  const fr = found.filter((r) => frenchIsbn(r.isbn));
+  const list = fr.length ? fr : found;
+  const byIsbn = new Map<string, any>();
+  for (const r of list.sort((a, b) => a.rank - b.rank)) {
+    const prev = byIsbn.get(r.isbn);
+    if (!prev) byIsbn.set(r.isbn, r);
+    else {
+      for (const k of ["series", "volume", "publisher", "authors", "date"]) if (!prev[k] && r[k]) prev[k] = r[k];
+      if (r.src === "cache" && r.cover) prev.cover = r.cover; // couverture déjà vérifiée
+      else if (!prev.cover && r.cover) prev.cover = r.cover;
+    }
+  }
+  // regroupement par série et éditeur (deux éditions = deux séries)
+  const groups = new Map<string, any>();
+  const books: any[] = [];
+  for (const r of byIsbn.values()) {
+    if (!r.series || !r.volume) { books.push(r); continue; }
+    const pw = pubWord(r.publisher);
+    const k = norm(r.series) + "|" + pw;
+    // un livre sans éditeur rejoint la série du même nom déjà vue
+    const g = groups.get(k) || (!pw ? [...groups.values()].find((x) => x.key === norm(r.series)) : null);
+    if (g) { if (!g.vols.some((v: any) => v.volume === r.volume)) g.vols.push(r); g.rank = Math.min(g.rank, r.rank); if (!g.publisher) g.publisher = r.publisher; }
+    else groups.set(k, { key: norm(r.series), name: r.series, publisher: r.publisher, rank: r.rank, vols: [r] });
+  }
+  const series = [...groups.values()].map((g) => {
+    g.vols.sort((a: any, b: any) => a.volume - b.volume);
+    const v1 = g.vols.find((v: any) => v.cover) || g.vols[0];
+    return { name: g.name, publisher: g.publisher, authors: v1.authors, cover: v1.cover, count: g.vols.length, maxVol: g.vols[g.vols.length - 1].volume, rank: g.rank,
+      vols: g.vols.map((v: any) => ({ isbn: v.isbn, volume: v.volume, title: v.title, cover: v.cover, date: v.date })) };
+  });
+  // une « série » d'un seul tome isolé reste dans les livres
+  const real = series.filter((s) => s.count > 1 || s.maxVol > 1);
+  for (const s of series) if (!real.includes(s)) books.push({ ...s.vols[0], publisher: s.publisher, authors: s.authors, series: s.name, volume: s.vols[0].volume });
+  const starts = (t: string) => norm(t).startsWith(q) ? 0 : 1;
+  real.sort((a, b) => starts(a.name) - starts(b.name) || b.count - a.count || a.rank - b.rank);
+  books.sort((a, b) => starts(a.title) - starts(b.title) || a.rank - b.rank);
+  const out = { series: real.slice(0, 12), books: books.slice(0, 30).map(({ rank, src, ...r }) => r) };
+  out.series.forEach((s: any) => delete s.rank);
+  if (found.length) await db.from("series_cache").upsert({ key, data: out, checked_at: new Date().toISOString() });
+  return out;
+}
+
 // ---------- Bibliothèques (sans compte : un identifiant + un code secret) ----------
 async function sha(s: string) {
   const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -957,6 +1044,7 @@ Deno.serve(async (req) => {
       }
       return json({ cover });
     }
+    if (action === "search") return json(await searchBooks(String(body.q || "")));
     if (action === "seriesInfo") return json({ info: await seriesInfo(String(body.series || ""), Array.isArray(body.books) ? body.books.slice(0, 300) : []) });
     if (action === "volumes") return json({ volumes: await volumes(String(body.series || ""), (body.volumes || []).map(Number).filter((n: number) => n > 0), String(body.publisher || ""), String(body.refIsbn || "")) });
 
