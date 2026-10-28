@@ -6,13 +6,14 @@
 // - register / sync : sauvegarde et synchronisation de la bibliothèque
 // - releases : sorties prévues (calculées en arrière-plan, à l'ouverture de l'appli et chaque nuit)
 import { createClient } from "npm:@supabase/supabase-js@2";
+import jpeg from "npm:jpeg-js@0.4.4";
 
 const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, {
   auth: { persistSession: false },
 });
 const GKEY = Deno.env.get("GOOGLE_BOOKS_KEY") || "";
 const CACHE_V = 11; // à augmenter quand la façon de lire les catalogues change
-const clean = (b: any) => { if (!b) return b; const { _m, ...rest } = b; return rest; };
+const clean = (b: any) => { if (!b) return b; const { _m, ev, ...rest } = b; return rest; };
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -153,19 +154,18 @@ function parseUnimarc(rec) {
     const ps = parseSeries(main, sub(t200, 'h'));
     if (ps.series) { series = ps.series; volume = ps.volume; }
   }
-  // Type de livre : la BnF dit si c'est du texte seul ou du texte + images, et classe les BD à part (805)
+  // Type de livre : tous les indices de la notice sont gardés, la décision est prise par classifyBook (avec les autres sources)
   const contents = marcFields(rec, '181').flatMap((f) => f.c || []);
   const cls = marcFields(rec, '686').map((f) => sub(f, 'a')).find(Boolean) || '';
   const origLang = marcFields(rec, '101').flatMap((f) => f.c || [])[0] || '';
-  const drawn = /dessin|sc[ée]nario/i.test(sub(t200, 'f') + ' ' + sub(t200, 'g'));
-  // rayon « Bandes dessinées » ou collection manga (« Shonen manga ») : c'est un manga, même si la notice dit « texte »
-  const subj = marcFields(rec, '608').concat(marcFields(rec, '606')).map((f) => sub(f, 'a')).join(' ');
-  const drawnHint = / (bandes? dessinees?|mangas?|shonen|shonen manga|seinen|shojo|josei|comics|webtoons?|manhwas?) /.test(' ' + norm(subj + ' ' + colls.join(' ')) + ' ');
-  const novelWord = /light ?novel|\broman\b/i.test(main + ' ' + subt + ' ' + colls.join(' '));
-  const bookKind = cls === '805' || drawn || (drawnHint && !novelWord && !/^80[0-46-9]$/.test(cls)) ? 'manga' : /^80[0-46-9]$/.test(cls) ? 'roman'
-    : contents.includes('sti') ? 'manga' : contents.includes('txt') ? 'roman' : '';
+  const resp = (sub(t200, 'f') + ' ' + sub(t200, 'g')).trim();
   const pubName = sub(marcFields(rec, '214')[0] || marcFields(rec, '210')[0], 'c');
-  const light = bookKind === 'roman' && (/light ?novel/i.test(main + ' ' + subt) || (isMangaPub(pubName) && ASIAN.includes(origLang) && (novelWord || /^80[0-46-9]$/.test(cls))));
+  const subjAll = marcFields(rec, '608').concat(marcFields(rec, '606')).map((f) => sub(f, 'a')).filter(Boolean);
+  const notes = marcFields(rec, '300').map((f) => sub(f, 'a')).concat(marcFields(rec, '307').map((f) => sub(f, 'a'))).filter(Boolean);
+  const ev = { bnf: { cls, contents, resp, notes }, titles: [main + ' ' + subt], publisher: pubName, collections: colls, subjects: subjAll,
+    descriptions: [sub(marcFields(rec, '330')[0], 'a')], origLang };
+  const cb = classifyBook(ev);
+  const bookKind = cb.category, light = cb.light;
   if (light && series && !LN_RE.test(series)) {
     const old = series; series = series + LN_SUFFIX;
     if (title.startsWith(old)) title = series + title.slice(old.length);
@@ -184,9 +184,7 @@ function parseUnimarc(rec) {
     isbn: /^97[89]\d{10}$/.test(isbn) ? isbn : '', title, authors: [...new Set(authors)].join(', '),
     publisher: sub(pubF, 'c'), publishedDate: year, pages, description: sub(marcFields(rec, '330')[0], 'a'),
     cover: hasCover && ark ? 'https://catalogue.bnf.fr/couverture?&appName=NE&idArk=' + ark + '&couverture=1' : '',
-    series, volume, ark, subjects, collection: colls.join(', '), kind: bookKind, light, origLang, price: price || null,
-    // « texte seul » (181) sans classement BD/roman : indice faible (la BnF le met aussi sur des mangas)
-    kindWeak: !(cls === '805' || drawn || drawnHint || /^80[0-46-9]$/.test(cls)),
+    series, volume, ark, subjects, collection: colls.join(', '), kind: bookKind, light, origLang, price: price || null, ev,
     // indices pour reconnaître la même édition (format, prix, collection) et écarter les produits dérivés
     _m: { main: norm(main), sub: norm(subt), colls, price, size },
   };
@@ -299,6 +297,50 @@ async function quickCover(isbn: string) {
   if ((await headSize(b)) > 8000) return b;
   return "";
 }
+// ---------- Couvertures toutes pareilles : on repère les bords blancs (ou d'une couleur unie) ajoutés autour du livre ----------
+// Résultat : [gauche, haut, droite, bas] en fraction de l'image, ou null s'il n'y a rien à couper
+function detectCrop(img: any) {
+  const { width: w, height: h, data } = img;
+  if (!w || !h) return null;
+  const px = (x, y) => { const i = (y * w + x) * 4; return [data[i], data[i + 1], data[i + 2]]; };
+  const avg = (x0, y0) => { const s = [0, 0, 0]; let n = 0; for (let y = y0; y < y0 + 3; y++) for (let x = x0; x < x0 + 3; x++) { const p = px(Math.min(w - 1, x), Math.min(h - 1, y)); s[0] += p[0]; s[1] += p[1]; s[2] += p[2]; n++; } return s.map((v) => v / n); };
+  const d = (a, b) => (Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2])) / 3;
+  const cs = [avg(0, 0), avg(w - 3, 0), avg(0, h - 3), avg(w - 3, h - 3)];
+  if (cs.some((c) => d(c, cs[0]) > 18)) return null; // coins différents : pas de fond uni autour
+  const bg = cs[0];
+  const line = (n, get) => { let ok = 0, tot = 0; const step = Math.max(1, Math.floor(n / 120)); for (let i = 0; i < n; i += step) { tot++; if (d(get(i), bg) < 22) ok++; } return ok / tot >= 0.985; };
+  const maxX = Math.floor(w * 0.35), maxY = Math.floor(h * 0.35);
+  let t = 0; while (t < maxY && line(w, (x) => px(x, t))) t++;
+  let b = 0; while (b < maxY && line(w, (x) => px(x, h - 1 - b))) b++;
+  let l = 0; while (l < maxX && line(h, (y) => px(l, y))) l++;
+  let r = 0; while (r < maxX && line(h, (y) => px(w - 1 - r, y))) r++;
+  let f = [l / w, t / h, r / w, b / h].map((v) => (v < 0.008 ? 0 : +v.toFixed(3)));
+  if (!f.some(Boolean)) return null;
+  const r0 = w / h, r1 = (w * (1 - f[0] - f[2])) / (h * (1 - f[1] - f[3]));
+  const frame = f.every((v) => v > 0 && v < 0.06);
+  if ((r0 < 0.6 || r0 > 0.76) && r1 >= 0.58 && r1 <= 0.8) return f;
+  if (frame) return f;
+  return null;
+}
+
+async function coverCrop(url: string) {
+  if (!url) return null;
+  const key = "crop1|" + url;
+  const { data: c } = await db.from("series_cache").select("data").eq("key", key).maybeSingle();
+  if (c) return c.data?.crop ?? null;
+  let crop = null, ok = false;
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(8000), headers: { "User-Agent": UA["User-Agent"] } });
+    const buf = new Uint8Array(await r.arrayBuffer());
+    if (r.ok && buf[0] === 0xff && buf[1] === 0xd8 && buf.length < 3e6) {
+      const img = jpeg.decode(buf, { useTArray: true, maxMemoryUsageInMB: 96, formatAsRGBA: true });
+      crop = detectCrop(img); ok = true;
+    } else ok = r.ok;
+  } catch { /* réessai plus tard */ }
+  if (ok) await db.from("series_cache").upsert({ key, data: { crop }, checked_at: new Date().toISOString() });
+  return crop;
+}
+
 // Images « pas de couverture » déjà repérées (Google en a plusieurs versions)
 const FAKE = new Set(["ba8cd5043eed", "f3426f39acd1"]);
 const fakeProbe: Record<string, Promise<void>> = {};
@@ -505,6 +547,81 @@ function categorize(parts: any[]): string {
   return "roman";
 }
 
+// ---------- Système d'analyse : manga (BD, comics, manhwa…) ou roman (light novel) ----------
+// Chaque indice de chaque source ajoute des points ; la décision se prend à la fin, sur l'ensemble
+const W_MANGA = / (mangas?|shonen|shounen|seinen|shojo|shoujo|josei|kodomo|yaoi|yuri|boys? love|ecchi|hentai|webtoons?|manhwas?|manhuas?|bandes? dessinees?|bd|comics?|graphic novels?|romans? graphiques?|comic books?|fumetti) /;
+const W_LN = / (light novels?|lightnovel) /;
+const W_ROMAN = / (romans?|novels?|litterature|fiction|recits?|nouvelles) /;
+function classifyBook(e: any) {
+  let manga = 0, roman = 0, ln = 0;
+  const why: string[] = [];
+  const pt = (k: string, n: number, r: string) => { if (k === "m") manga += n; else if (k === "r") roman += n; else ln += n; why.push((k === "m" ? "manga" : k === "r" ? "roman" : "light novel") + " +" + n + " : " + r); };
+  const T = (x: any) => " " + norm([x].flat(3).filter(Boolean).join(" ")) + " ";
+  const has = (re: RegExp, x: any) => re.test(T(x));
+  const B = e.bnf;
+  if (B) {
+    if (B.cls === "805") pt("m", 6, "BnF classée bande dessinée");
+    else if (/^80[0-46-9]$/.test(B.cls)) pt("r", 5, "BnF classée littérature (" + B.cls + ")");
+    if (B.contents.includes("sti")) pt("m", 3, "BnF : images fixes");
+    else if (B.contents.includes("txt")) pt("r", 0.5, "BnF : texte (indice faible)");
+    if (/dessin|sc[ée]nario|mangaka/i.test(B.resp)) pt("m", 5, "BnF : dessinateur / scénariste");
+    if (/illustr/i.test(B.resp) && !/dessin/i.test(B.resp)) pt("l", 1, "BnF : illustrations (roman illustré)");
+    if (has(/ sens de lecture japonais /, B.notes)) pt("m", 4, "BnF : sens de lecture japonais");
+    // la BnF met presque toujours un indice BD sur les mangas : une notice « texte » sans aucun de ces indices penche vers le roman
+    const bnfDrawn = B.cls === "805" || B.contents.includes("sti") || /dessin|sc[ée]nario/i.test(B.resp) || has(/ sens de lecture japonais /, B.notes) ||
+      (e.subjects || []).some((x: string) => W_MANGA.test(T(x))) || (e.collections || []).some((x: string) => W_MANGA.test(T(x)));
+    if (!bnfDrawn && B.contents.includes("txt")) pt("r", 2.5, "BnF : texte, sans aucun indice BD");
+  }
+  // rayons et sujets (BnF 608/606, Leslibraires, Google)
+  for (const x of e.subjects || []) {
+    const t = T(x);
+    if (W_LN.test(t)) pt("l", 4, "rayon « " + x + " »");
+    else if (W_MANGA.test(t)) pt("m", 3, "rayon « " + x + " »");
+    else if (W_ROMAN.test(t)) pt("r", 2, "rayon « " + x + " »");
+  }
+  for (const x of e.rayons || []) {
+    const t = T(x);
+    if (W_LN.test(t)) pt("l", 3, "libraire : « " + x + " »");
+    else if (W_MANGA.test(t)) pt("m", 1.5, "libraire : « " + x + " »"); // les libraires se trompent parfois
+    else if (W_ROMAN.test(t)) pt("r", 1.5, "libraire : « " + x + " »");
+  }
+  for (const x of e.googleCats || []) {
+    if (/comics|graphic/i.test(x)) pt("m", 1, "Google : " + x);
+    else if (/fiction/i.test(x)) pt("r", 0.5, "Google : " + x);
+  }
+  // collections (« Shonen manga », « Pika Roman », « Light Novel »…)
+  for (const x of e.collections || []) {
+    const t = T(x);
+    if (W_LN.test(t)) pt("l", 5, "collection « " + x + " »");
+    else if (/ roman /.test(t)) pt("r", 4, "collection « " + x + " »");
+    else if (W_MANGA.test(t)) pt("m", 3, "collection « " + x + " »");
+  }
+  // titres (sans le « (roman) » ajouté par l'appli)
+  for (const x of e.titles || []) {
+    const t = T(String(x || "").replace(/\s*\(roman\)/gi, ""));
+    if (W_LN.test(t)) { pt("l", 5, "titre « light novel »"); break; }
+    if (/ (roman|novel) /.test(t) && !/ romans? graphiques? /.test(t)) { pt("r", 4, "titre avec « roman »"); break; }
+  }
+  // descriptions (4e de couverture)
+  const D = T(e.descriptions || []);
+  if (W_LN.test(D)) pt("l", 3, "description : light novel");
+  const mWords = (D.match(/ (manga|mangas|mangaka|shonen|seinen|shojo|webtoon|manhwa) /g) || []).length;
+  if (mWords) pt("m", Math.min(3, 1.5 * mWords), "description : " + mWords + " mot(s) manga");
+  if (/ (le roman|ce roman|un roman|romancier|romanciere|best seller) /.test(D) && !/ roman graphique /.test(D)) pt("r", 1.5, "description : roman");
+  // éditeur
+  const P = e.publisher || "";
+  if (pubIn(LN_PUB, P)) pt("l", 5, "éditeur de light novels (" + P + ")");
+  else if (isMangaPub(P)) pt("m", 2, "éditeur de mangas (" + P + ")");
+  else if (pubIn(BD_PUB, P)) pt("m", 1.5, "éditeur de BD (" + P + ")");
+  // un « roman » d'origine asiatique chez un éditeur de mangas = light novel
+  const asian = ASIAN.includes(e.origLang || "");
+  const total = { manga, roman: roman + ln };
+  const category = total.roman > total.manga ? "roman" : total.manga > 0 ? "manga" : (e.fallback || "roman");
+  const light = category === "roman" && (ln > 0 || (asian && isMangaPub(P)));
+  if (light && ln === 0) why.push("light novel : roman traduit " + (e.origLang || "") + " chez un éditeur de mangas");
+  return { category, light, score: { manga: +manga.toFixed(1), roman: +roman.toFixed(1), ln: +ln.toFixed(1) }, why };
+}
+
 // ---------- Recherche d'un livre ----------
 async function lookup(isbn: string) {
   // la recherche Amazon (pour la couverture) part tout de suite, en même temps que les catalogues
@@ -524,9 +641,8 @@ async function lookup(isbn: string) {
       if (r) { gotAny(); if (name === "BnF" || name === "Leslibraires") gotMain(); }
     } catch (e) { results[i] = { name, r: null, msg: String((e as Error)?.message || e) }; }
   }));
-  // On répond dès qu'une source principale a trouvé (+1,2 s pour compléter), ou 3 s après une autre source
-  await Promise.race([all, main, any.then(() => sleep(3000))]);
-  await Promise.race([all, sleep(1200)]);
+  // On attend toutes les sources (au plus 7 s après la première réponse) : la décision manga / roman se prend sur l'ensemble
+  await Promise.race([all, any.then(() => sleep(7000)), sleep(20000)]);
   let found = results.map((x) => x.r).filter(Boolean);
   // Rien trouvé : on essaie Decitre en secours
   if (!found.length) {
@@ -560,19 +676,26 @@ async function lookup(isbn: string) {
     series, volume, ark: bnf?.ark || "", collection: first(ll?.collection, pdl?.collection, bnf?.collection),
     price: first(ll?.price, pdl?.price, bnf?.price) || null,
   };
-  // Type de livre, du plus sûr au moins sûr : la notice BnF, le mot « roman » / « light novel » dans un titre, puis rayon et éditeur
-  // (les rayons des libraires sont parfois faux : Leslibraires range le roman Solo Leveling en BD)
-  const titlesTxt = " " + norm(found.map((f: any) => String(f.title || "").replace(/\s*\(roman\)/gi, "")).join(" ")) + " ";
-  const saysNovel = / (light novel|novel|roman) /.test(titlesTxt);
-  // un « roman » de la BnF déduit du seul champ 181, chez un éditeur de mangas, sans le mot roman : c'est un manga
-  const pubTxt = first(ll?.publisher, bnf?.publisher, pdl?.publisher, pickAll("publisher"));
-  const weakRoman = bnf?.kind === "roman" && bnf?.kindWeak && isMangaPub(pubTxt) && !saysNovel && !/ light novel /.test(" " + norm(b.collection) + " ");
-  const kind = (weakRoman ? "" : bnf?.kind) || (saysNovel ? "roman" : "");
-  b.category = kind || categorize([found.map((f: any) => [f.subjects, f.collection]), b.publisher, b.collection]);
-  const origLang = bnf?.origLang || ll?.origLang || "";
-  const light = b.category === "roman" && (bnf?.light || / light novel /.test(titlesTxt + norm(b.collection) + " ") || LN_PUB.some((x) => (" " + norm(b.publisher) + " ").includes(" " + x + " ")) ||
-    (isMangaPub(b.publisher) && (saysNovel || ASIAN.includes(origLang))));
-  if (!light && LN_RE.test(b.series || "")) { // la BnF avait cru à un light novel
+  // Type de livre : le système d'analyse lit tout (notice BnF complète, rayons, collections, titres, descriptions, éditeur)
+  const llColl = ll?.collection ? [ll.collection] : [];
+  const ev = {
+    bnf: bnf?.ev?.bnf || null,
+    titles: found.map((f: any) => f.title),
+    publisher: b.publisher,
+    collections: [...(bnf?.ev?.collections || []), ...llColl, pdl?.collection].filter(Boolean),
+    subjects: bnf?.ev?.subjects || [],
+    rayons: (ll?.subjects || []).filter((x: string) => !llColl.includes(x)),
+    googleCats: gg?.subjects || [],
+    descriptions: found.map((f: any) => f.description),
+    origLang: bnf?.origLang || ll?.origLang || "",
+    fallback: categorize([b.publisher, b.collection]),
+  };
+  const cb = classifyBook(ev);
+  b.category = cb.category;
+  b.classScore = cb.score; b.classWhy = cb.why.slice(0, 14);
+  const origLang = ev.origLang;
+  const light = cb.light;
+  if (!light && LN_RE.test(b.series || "")) { // la BnF seule avait cru à un light novel
     b.series = baseName(b.series);
     if (b.volume) b.title = b.series + " – Tome " + b.volume;
   }
@@ -597,6 +720,7 @@ async function lookup(isbn: string) {
     for (const c of [...new Set(cands)]) { if (await okImage(c)) { b.cover = c; break; } }
   }
   if (!b.cover) b.cover = await findCover(isbn, b.ark, b);
+  if (b.cover) { b.coverCrop = await coverCrop(b.cover).catch(() => null); b.cropFor = b.cover; }
   return { book: b, report, networkError: false };
 }
 
@@ -649,7 +773,8 @@ async function volumes(series: string, vols: number[], publisher: string, refIsb
         best = pickVolume(recs, v, key, ref);
       } catch { /* Google ensuite */ }
       if (!best && gIndex.has(v)) best = gIndex.get(v)!;
-      if (best && best.cover && !(await okImage(best.cover))) best.cover = "";
+      if (best && best.isbn) { const q = await quickCover(best.isbn); if (q) best.cover = q; } // Amazon d'abord
+      if (best && best.cover && !/amazon|bdfugue/.test(best.cover) && !(await okImage(best.cover))) best.cover = "";
       if (best && best.isbn && !best.cover) best.cover = await findCover(best.isbn, best.ark, best);
       out[v] = clean(best);
     }
@@ -1158,7 +1283,15 @@ Deno.serve(async (req) => {
         const { data: c } = await db.from("book_cache").select("data").eq("isbn", isbn).maybeSingle();
         if (c?.data) await db.from("book_cache").update({ data: { ...c.data, cover } }).eq("isbn", isbn);
       }
-      return json({ cover });
+      return json({ cover, crop: cover ? await coverCrop(cover).catch(() => null) : null });
+    }
+    if (action === "coverInfo") {
+      const urls = [...new Set((body.urls || []).map(String).filter((u: string) => /^https:\/\//.test(u)))].slice(0, 16);
+      const crops: Record<string, any> = {};
+      const work = urls.slice();
+      const worker = async () => { while (work.length) { const u = work.shift() as string; crops[u] = await coverCrop(u).catch(() => null); } };
+      await Promise.all([worker(), worker(), worker(), worker()]);
+      return json({ crops });
     }
     if (action === "search") return json(await searchBooks(body.adv ? body : String(body.q || "")));
     if (action === "seriesInfo") return json({ info: await seriesInfo(String(body.series || ""), Array.isArray(body.books) ? body.books.slice(0, 300) : []) });

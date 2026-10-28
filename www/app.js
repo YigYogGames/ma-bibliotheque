@@ -348,25 +348,55 @@
   // Le serveur cherche d'abord sur Amazon (le titre sert à vérifier que c'est le bon livre), puis chez les libraires
   async function findCoverAny(isbn, ark, b) {
     const info = b ? { title: b.title || '', series: b.series || '', volume: b.volume || null } : {};
-    try { const r = await api('cover', Object.assign({ isbn, ark }, info), 30000); return r.cover || ''; } catch (e) { /* serveur injoignable : recherche directe */ }
+    try {
+      const r = await api('cover', Object.assign({ isbn, ark }, info), 30000);
+      if (b && r.cover) { b.cropFor = r.cover; if (r.crop) b.coverCrop = r.crop; else delete b.coverCrop; }
+      return r.cover || '';
+    } catch (e) { /* serveur injoignable : recherche directe */ }
     return findCover(isbn, ark);
   }
   // Une seule fois : on remplace les couvertures qui ne viennent pas d'Amazon (fausses images Google, images BnF très lourdes)
   const isAmazon = (u) => /media-amazon\.com|images-amazon\.com/.test(u || '');
   async function upgradeCovers() {
-    const todo = state.books.filter((b) => b.isbn && !b.coverPhoto && (b.coverV || 0) < 2 && !isAmazon(b.cover));
+    const todo = state.books.filter((b) => b.isbn && !b.coverPhoto && (b.coverV || 0) < 3 && !isAmazon(b.cover));
     let changed = 0;
     for (const b of todo) {
       let u;
       try { u = (await api('cover', { isbn: b.isbn, ark: b.ark, title: b.title || '', series: b.series || '', volume: b.volume || null }, 30000)).cover || ''; }
       catch (e) { return; } // pas de réseau : on réessaiera au prochain lancement
-      b.coverV = 2;
+      b.coverV = 3;
       if (u && u !== b.cover) { b.cover = u; changed++; }
       save();
       if (changed && changed % 5 === 0) scheduleRender();
       await new Promise((r) => setTimeout(r, 400));
     }
     if (changed) { scheduleRender(); toast(changed + ' couverture' + (changed > 1 ? 's' : '') + ' améliorée' + (changed > 1 ? 's' : '')); }
+  }
+  // Couvertures toutes pareilles : le serveur repère les bords blancs (ou unis) autour de l'image, l'appli les coupe à l'affichage
+  async function cropCovers() {
+    const todo = state.books.filter((b) => /^https:/.test(b.cover || '') && b.cropFor !== b.cover);
+    let changed = 0;
+    for (let i = 0; i < todo.length; i += 16) {
+      const part = todo.slice(i, i + 16);
+      let crops;
+      try { crops = (await api('coverInfo', { urls: part.map((b) => b.cover) }, 60000)).crops || {}; } catch (e) { return; }
+      for (const b of part) {
+        if (!(b.cover in crops)) continue;
+        b.cropFor = b.cover;
+        if (crops[b.cover]) { b.coverCrop = crops[b.cover]; changed++; } else delete b.coverCrop;
+      }
+      save();
+    }
+    if (changed) scheduleRender();
+  }
+  const VIEW_BOX = typeof CSS !== 'undefined' && CSS.supports && CSS.supports('object-view-box', 'inset(1% 1% 1% 1%)');
+  function croppedImg(b, attrs) {
+    const c = b.cropFor === b.cover && Array.isArray(b.coverCrop) ? b.coverCrop : null;
+    if (!c) return `<img src="${esc(b.cover)}" ${attrs}>`;
+    const [l, t, r, bt] = c.map((x) => Math.max(0, Math.min(0.4, +x || 0)));
+    if (VIEW_BOX) return `<img src="${esc(b.cover)}" style="object-view-box:inset(${t * 100}% ${r * 100}% ${bt * 100}% ${l * 100}%)" ${attrs}>`;
+    const w = 1 - l - r, h = 1 - t - bt;
+    return `<span class="crop-wrap"><img src="${esc(b.cover)}" style="position:absolute;max-width:none;object-fit:fill;width:${(100 / w).toFixed(2)}%;height:${(100 / h).toFixed(2)}%;left:${(-l / w * 100).toFixed(2)}%;top:${(-t / h * 100).toFixed(2)}%" ${attrs}></span>`;
   }
   function coverLater(b) {
     if (!b.isbn || b.coverPhoto || b.cover) return;
@@ -475,14 +505,14 @@
   function coverHTML(b) {
     const fake = `<div class="fake-cover" style="background:${hashColor(b.series || b.title)}"><div class="fc-title">${esc(b.title || 'Sans titre')}</div><div class="fc-author">${esc(b.authors || '')}</div></div>`;
     if (!b.cover) return fake;
-    return `<img src="${esc(b.cover)}" alt="" loading="lazy" decoding="async" onerror="window.__badCover(this)" data-id="${esc(b.id || '')}" data-fb="${esc(fake)}">`;
+    return croppedImg(b, `alt="" loading="lazy" decoding="async" onerror="window.__badCover(this)" data-id="${esc(b.id || '')}" data-fb="${esc(fake)}"`);
   }
 
   // Image de couverture qui ne s'affiche pas : on met la couverture de secours et on cherche une autre source
   const badCoverTried = new Set();
   window.__badCover = (img) => {
     const id = img.dataset.id;
-    img.outerHTML = img.dataset.fb;
+    (img.parentElement && img.parentElement.classList.contains('crop-wrap') ? img.parentElement : img).outerHTML = img.dataset.fb;
     if (!id || badCoverTried.has(id)) return;
     badCoverTried.add(id);
     const b = state.books.find((x) => x.id === id);
@@ -664,7 +694,8 @@
       // v0.15 : tomes de manga pris pour des light novels (« One piece (roman) »), hors-séries comptés comme un tome (deux « tome 3 »)
       const dup = new Set(); const seen = new Map();
       for (const b of state.books) if (b.series && b.volume) { const k = norm(b.series) + '#' + b.volume; if (seen.has(k)) { dup.add(b); dup.add(seen.get(k)); } else seen.set(k, b); }
-      const recheck15 = (b) => !b.recat15 && b.isbn && (LN_RE.test(b.series || '') || b.format === 'Light novel' || dup.has(b));
+      // v0.15 : nouveau système d'analyse (toutes les sources) : chaque livre est revérifié une fois
+      const recheck15 = (b) => !b.recat16 && b.isbn;
       const todo = state.books.filter((b) => b.isbn && ((!b.category && !b.catTriedAt) || (!b.format && !b.fmtTriedAt) || (b.price == null && !b.priceTriedAt) || recheck(b) || recheck15(b)));
       for (let i = 0; i < todo.length; i += 6) {
         const chunk = todo.slice(i, i + 6);
@@ -674,7 +705,7 @@
           const f = res[b.isbn];
           const rc = recheck(b), rc15 = recheck15(b);
           b.catTriedAt = b.fmtTriedAt = b.priceTriedAt = Date.now();
-          if (f) b.recat15 = 1;
+          if (f) { b.recat16 = 1; if (f.classWhy) { b.classWhy = f.classWhy; b.classScore = f.classScore; } }
           if (f && rc15) {
             const base = (x) => norm(String(x || '').replace(LN_RE, ''));
             // le serveur ne voit plus un light novel : on retire « (roman) » et on remet le tome avec les autres
@@ -692,7 +723,7 @@
             else if (f.format === 'Light novel' && b.format !== 'Light novel') b.format = f.format;
           }
           if (f) b.recat14 = 1;
-          if (f && f.format && (!b.format || rc)) b.format = f.format;
+          if (f && f.format && (!b.format || rc || (rc15 && !b.catManual))) b.format = f.format;
           if (f && f.genre && !b.genre) b.genre = f.genre;
           if (f && f.price && !b.price) b.price = f.price;
           // un light novel rangé avec le manga du même nom : on le met dans sa propre série « Nom (roman) »
@@ -1330,6 +1361,9 @@
       ${tiles ? `<div class="bc-tiles">${tiles}</div>` : ''}
       ${b.description ? `<div class="bc-summary"><h3>Résumé</h3><p class="${long ? 'clamp' : ''}">${esc(b.description)}</p>
         ${long ? `<button class="bc-more" onclick="const p=this.previousElementSibling;p.classList.toggle('clamp');this.textContent=p.classList.contains('clamp')?'Lire la suite':'Réduire'">Lire la suite</button>` : ''}</div>` : ''}
+      ${Array.isArray(b.classWhy) && b.classWhy.length && !b.catManual ? `<details class="bc-why"><summary>Pourquoi « ${esc(b.format || CATS[catOf(b)].label)} » ?</summary>
+        <ul>${b.classWhy.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>
+        <p class="muted small">Si c'est faux, utilise le bouton « Vers les … » en bas : ton choix sera gardé.</p></details>` : ''}
     </div>`;
   }
   // Icônes des boutons de la fiche
@@ -2521,7 +2555,7 @@
     syncNow().then(() => { autoReleases(); return classifyLibrary(); }).catch(() => {}).then(() => loadSeriesInfo()).catch(() => {});
   }, 300);
   // Couvertures manquantes, sans gêner le démarrage
-  setTimeout(() => repairCovers().catch(() => {}).then(() => upgradeCovers()).catch(() => {}), 4000);
+  setTimeout(() => repairCovers().catch(() => {}).then(() => upgradeCovers()).catch(() => {}).then(() => cropCovers()).catch(() => {}), 4000);
 
   // Version web sur iPhone : explique comment la mettre sur l'écran d'accueil (une fois)
   (() => {

@@ -895,3 +895,8 @@ html.scanning body::after { display: none; }
 /* v0.15 : tome en cours de recherche */
 .as-vol.pending { opacity: .55; cursor: default; }
 .as-vol.pending::after { content: ""; position: absolute; left: 50%; top: 50%; width: 16px; height: 16px; margin: -8px 0 0 -8px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; animation: spin .9s linear infinite; color: var(--accent); }
+/* couverture recadrée (bords blancs coupés) quand object-view-box n'existe pas (iPhone) */
+.crop-wrap { position: relative; display: block; width: 100%; height: 100%; overflow: hidden; }
+.bc-why { margin: 14px 2px 0; font-size: 13px; color: var(--muted); }
+.bc-why summary { cursor: pointer; font-weight: 600; color: var(--text); opacity: .85; }
+.bc-why ul { margin: 8px 0 6px; padding-left: 18px; line-height: 1.5; }
