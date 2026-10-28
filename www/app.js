@@ -299,8 +299,10 @@
     let isbn = cleanIsbn(raw);
     if (isbn.length === 10) isbn = isbn10to13(isbn);
     try {
-      const r = await api('lookup', { isbn }, 30000);
+      // réponse rapide : le serveur renvoie une fiche dès les premières sources, et termine la vérification en arrière-plan
+      const r = await api('lookup', { isbn, fast: true }, 30000);
       lastLookupReport = (r.report || []).concat(['serveur : OK']);
+      if (r.book && r.provisional) { for (const ms of [35000, 90000]) setTimeout(() => classifyLibrary().catch(() => {}), ms); }
       if (r.book) return stripV(r.book);
       if (!r.networkError) return null; // les catalogues ne connaissent pas ce livre
     } catch (e) {
@@ -695,7 +697,7 @@
       const dup = new Set(); const seen = new Map();
       for (const b of state.books) if (b.series && b.volume) { const k = norm(b.series) + '#' + b.volume; if (seen.has(k)) { dup.add(b); dup.add(seen.get(k)); } else seen.set(k, b); }
       // v0.15 : nouveau système d'analyse (toutes les sources) : chaque livre est revérifié une fois
-      const recheck15 = (b) => !b.recat16 && b.isbn;
+      const recheck15 = (b) => (!b.recat16 || b.provisional) && b.isbn;
       const todo = state.books.filter((b) => b.isbn && ((!b.category && !b.catTriedAt) || (!b.format && !b.fmtTriedAt) || (b.price == null && !b.priceTriedAt) || recheck(b) || recheck15(b)));
       for (let i = 0; i < todo.length; i += 6) {
         const chunk = todo.slice(i, i + 6);
@@ -705,7 +707,8 @@
           const f = res[b.isbn];
           const rc = recheck(b), rc15 = recheck15(b);
           b.catTriedAt = b.fmtTriedAt = b.priceTriedAt = Date.now();
-          if (f) { b.recat16 = 1; if (f.classWhy) { b.classWhy = f.classWhy; b.classScore = f.classScore; } }
+          if (f && f.provisional) continue; // vérification pas encore finie : on réessaiera
+          if (f) { b.recat16 = 1; delete b.provisional; if (f.classWhy) { b.classWhy = f.classWhy; b.classScore = f.classScore; } }
           if (f && rc15) {
             const base = (x) => norm(String(x || '').replace(LN_RE, ''));
             // le serveur ne voit plus un light novel : on retire « (roman) » et on remet le tome avec les autres
@@ -1100,7 +1103,7 @@
     onlineTimer = setTimeout(async () => {
       const mine = onlineQ;
       let res;
-      try { res = await searchOnline(q); }
+      try { res = await searchOnline(q, (r) => { if (mine === onlineQ && !h.hidden && !h.querySelector('.as-vol')) renderSearchResults(h, r, q); }); }
       catch (e) { if (mine === onlineQ) h.innerHTML = '<p class="as-hint">Pas de connexion : impossible de chercher en ligne pour l’instant.</p>'; return; }
       if (mine !== onlineQ) return;
       renderSearchResults(h, res, q);
@@ -1867,11 +1870,21 @@
   const SEARCH_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>';
   const searchCache = new Map();
   let searchSeq = 0;
-  async function searchOnline(q) {
+  // le catalogue du serveur répond tout de suite ; les libraires complètent : on redemande une fois, un peu plus tard
+  function refreshLater(params, key, cache, onUpdate) {
+    setTimeout(async () => {
+      try {
+        const r = await api('search', params, 40000);
+        if (r && !r.fromCatalog) { cache.set(key, r); onUpdate && onUpdate(r); }
+        else if (r) setTimeout(async () => { try { const r2 = await api('search', params, 40000); cache.set(key, r2); onUpdate && onUpdate(r2); } catch (e) { /* tant pis */ } }, 15000);
+      } catch (e) { /* on garde le premier résultat */ }
+    }, 12000);
+  }
+  async function searchOnline(q, onUpdate) {
     const k = norm(q);
     if (searchCache.has(k)) return searchCache.get(k);
     let res;
-    try { res = await api('search', { q }, 40000); }
+    try { res = await api('search', { q }, 40000); if (res && res.fromCatalog) refreshLater({ q }, k, searchCache, onUpdate); }
     catch (e) {
       // serveur indisponible : Google Books directement
       const d = await getJSON('https://www.googleapis.com/books/v1/volumes?q=' + encodeURIComponent('intitle:' + q) + '&maxResults=40&printType=books&langRestrict=fr&country=FR', 12000);
@@ -2110,6 +2123,9 @@
     if (advCache.has(k)) return advCache.get(k);
     const r = await api('search', Object.assign({ adv: true }, p), 45000);
     advCache.set(k, r);
+    if (r && r.fromCatalog) refreshLater(Object.assign({ adv: true }, p), k, advCache, (r2) => {
+      const box = $('#advResults'); if (box && JSON.stringify(advLast) === JSON.stringify(Object.assign({}, p, { volume: String(p.volume || '') }))) renderSearchResults(box, r2, p.q || p.author || p.publisher, () => openAdvancedSearch(advLast), 'Résultats');
+    });
     return r;
   }
   function openAdvancedSearch(prev) {

@@ -324,7 +324,7 @@ function detectCrop(img: any) {
 }
 
 async function coverCrop(url: string) {
-  if (!url) return null;
+  if (!url || /images-amazon\.com\/images\/P\//.test(url)) return null; // scans Amazon : jamais de bords, inutile de les analyser
   const key = "crop1|" + url;
   const { data: c } = await db.from("series_cache").select("data").eq("key", key).maybeSingle();
   if (c) return c.data?.crop ?? null;
@@ -623,7 +623,7 @@ function classifyBook(e: any) {
 }
 
 // ---------- Recherche d'un livre ----------
-async function lookup(isbn: string) {
+async function lookup(isbn: string, wait = 7000, quick = false) {
   // la recherche Amazon (pour la couverture) part tout de suite, en même temps que les catalogues
   const amzCands = isbn13to10(isbn) ? undefined : amazonCandidates(isbn).catch(() => []);
   const sources: [string, (i: string) => Promise<any>][] = [
@@ -642,7 +642,7 @@ async function lookup(isbn: string) {
     } catch (e) { results[i] = { name, r: null, msg: String((e as Error)?.message || e) }; }
   }));
   // On attend toutes les sources (au plus 7 s après la première réponse) : la décision manga / roman se prend sur l'ensemble
-  await Promise.race([all, any.then(() => sleep(7000)), sleep(20000)]);
+  await Promise.race([all, quick ? main.then(() => sleep(wait)) : any.then(() => sleep(wait)), any.then(() => sleep(quick ? 3500 : 20000)), sleep(20000)]);
   let found = results.map((x) => x.r).filter(Boolean);
   // Rien trouvé : on essaie Decitre en secours
   if (!found.length) {
@@ -719,12 +719,13 @@ async function lookup(isbn: string) {
     const cands = [ll?.cover, "https://products-images.di-static.com/image/x/" + isbn + "-475x500-1.jpg", bnf?.cover, pdl?.cover, gg?.cover, pickAll("cover")].filter(Boolean);
     for (const c of [...new Set(cands)]) { if (await okImage(c)) { b.cover = c; break; } }
   }
-  if (!b.cover) b.cover = await findCover(isbn, b.ark, b);
-  if (b.cover) { b.coverCrop = await coverCrop(b.cover).catch(() => null); b.cropFor = b.cover; }
+  if (!b.cover && !quick) b.cover = await findCover(isbn, b.ark, b);
+  if (!b.cover && quick) b.cover = await quickCover(isbn);
+  if (b.cover && !quick) { b.coverCrop = await coverCrop(b.cover).catch(() => null); b.cropFor = b.cover; }
   return { book: b, report, networkError: false };
 }
 
-async function cachedLookup(raw: string) {
+async function cachedLookup(raw: string, fast = false) {
   let isbn = String(raw || "").replace(/[^0-9Xx]/g, "").toUpperCase();
   if (isbn.length === 10) isbn = isbn10to13(isbn);
   if (isbn.length !== 13) return { book: null, report: ["ISBN invalide"] };
@@ -733,12 +734,158 @@ async function cachedLookup(raw: string) {
   if (c && ((c.found && c.data?.v === CACHE_V && age < 60 * 864e5) || (!c.found && age < 2 * 864e5))) {
     return { book: c.data, report: ["mémoire du serveur"], cached: true };
   }
-  const res = await lookup(isbn);
-  if (res.book) res.book = { ...clean(res.book), v: CACHE_V };
-  if (res.book || !res.networkError) {
-    await db.from("book_cache").upsert({ isbn, data: res.book, found: !!res.book, updated_at: new Date().toISOString() });
+  // scan : une recherche rapide part en même temps que la complète ; la première qui répond est renvoyée
+  const quickP = fast ? lookup(isbn, 900, true).catch(() => null) : null;
+  const full = (async () => {
+    const res = await lookup(isbn);
+    if (res.book) res.book = { ...clean(res.book), v: CACHE_V };
+    if (res.book || !res.networkError) {
+      await db.from("book_cache").upsert({ isbn, data: res.book, found: !!res.book, updated_at: new Date().toISOString() });
+    }
+    if (res.book?.series) catalogSeed([{ name: res.book.series, publisher: res.book.publisher, isbn, volume: res.book.volume }]).catch(() => {});
+    return res;
+  })();
+  if (!fast) return await full;
+  const win: any = await Promise.race([full.then((r) => ({ r, full: true })), quickP!.then((r) => ({ r, full: false }))]);
+  if (win.full) return win.r;
+  const q = win.r;
+  if (!q || !q.book) return await full;
+  // fiche provisoire tout de suite ; la vérification complète continue en arrière-plan et sera enregistrée
+  // @ts-ignore EdgeRuntime existe sur Supabase
+  if (typeof EdgeRuntime !== "undefined" && EdgeRuntime.waitUntil) EdgeRuntime.waitUntil(full.catch(() => {}));
+  return { book: { ...clean(q.book), provisional: true }, report: q.report, provisional: true };
+}
+
+// ---------- Catalogue : toutes les séries des bibliothèques, préparées à l'avance par le serveur ----------
+// chaque série : son dernier tome paru en France, l'ISBN de chaque tome, et la fiche complète de chaque tome (book_cache)
+const catKey = (name: string, pub: string) => norm(name) + "|" + pubWord(pub || "");
+// ajoute des séries au catalogue (ou signale qu'on possède des tomes plus loin)
+async function catalogSeed(items: { name: string; publisher: string; isbn?: string; volume?: number | null }[]) {
+  const groups = new Map<string, any>();
+  for (const it of items) {
+    if (!it.name) continue;
+    const k = catKey(it.name, it.publisher);
+    const g = groups.get(k) || { key: k, name: it.name, publisher: it.publisher || "", ref_isbn: "", owned_max: 0, vols: {} as Record<string, string> };
+    if (it.volume && it.isbn) { g.vols[String(it.volume)] = it.isbn; if (it.volume >= g.owned_max) { g.owned_max = it.volume; g.ref_isbn = it.isbn; } }
+    if (!g.ref_isbn && it.isbn) g.ref_isbn = it.isbn;
+    groups.set(k, g);
   }
-  return res;
+  if (!groups.size) return 0;
+  const keys = [...groups.keys()];
+  const ex = new Map<string, any>();
+  for (let i = 0; i < keys.length; i += 200) {
+    const { data } = await db.from("catalog_series").select("key, owned_max, vols, ref_isbn").in("key", keys.slice(i, i + 200));
+    for (const r of data || []) ex.set(r.key, r);
+  }
+  const rows: any[] = [];
+  for (const g of groups.values()) {
+    const e = ex.get(g.key);
+    if (!e) { rows.push({ ...g, status: "todo", next_check: new Date().toISOString() }); continue; }
+    const vols = { ...(e.vols || {}) };
+    let changed = false;
+    for (const [v, i] of Object.entries(g.vols)) if (!vols[v]) { vols[v] = i; changed = true; }
+    if (g.owned_max > (e.owned_max || 0) || changed) {
+      rows.push({ key: g.key, name: g.name, publisher: g.publisher, ref_isbn: g.owned_max > (e.owned_max || 0) ? g.ref_isbn : e.ref_isbn || g.ref_isbn,
+        owned_max: Math.max(g.owned_max, e.owned_max || 0), vols, status: "todo", next_check: new Date().toISOString() });
+    }
+  }
+  for (let i = 0; i < rows.length; i += 200) await db.from("catalog_series").upsert(rows.slice(i, i + 200));
+  return rows.length;
+}
+// toutes les séries de toutes les bibliothèques (au plus toutes les 10 minutes)
+async function catalogSeedLibraries() {
+  const { data: cfg } = await db.from("app_config").select("value").eq("key", "catalog_seeded").maybeSingle();
+  if (cfg && Date.now() - Number(cfg.value) < 10 * 60e3) return 0;
+  await db.from("app_config").upsert({ key: "catalog_seeded", value: String(Date.now()) });
+  const items: any[] = [];
+  for (let from = 0; ; from += 1000) {
+    const { data } = await db.from("library_books").select("data").eq("deleted", false).range(from, from + 999);
+    for (const r of data || []) { const b = r.data; if (b && b.series) items.push({ name: b.series, publisher: b.publisher || "", isbn: b.isbn || "", volume: b.volume || null }); }
+    if (!data || data.length < 1000) break;
+  }
+  return await catalogSeed(items);
+}
+// un passage de préparation sur une série : dernier tome paru, ISBN manquants, fiches complètes
+async function crawlStep(deadline: number) {
+  const { data: rows } = await db.rpc("claim_catalog_series");
+  const s = rows && rows[0];
+  if (!s) return null;
+  const vols: Record<string, string | null> = { ...(s.vols || {}) };
+  const key = norm(s.name);
+  let ref: any = null;
+  if (s.ref_isbn) { try { ref = await srcBnf(s.ref_isbn); } catch { /* sans référence */ } }
+  if (!ref) ref = { publisher: s.publisher };
+  const probe = async (v: number) => {
+    try { const r = pickVolume(await withRetry(() => bnfVolumeSearch(s.name, v, ref.publisher || s.publisher), 2), v, key, ref); if (r?.isbn) vols[String(v)] = r.isbn; return !!r; }
+    catch { return false; }
+  };
+  const stats = { series: s.name, probes: 0, isbns: 0, lookups: 0 };
+  // 1) dernier tome paru en France : sauts (+1, +2, +4…) puis on resserre
+  let latest = Math.max(s.latest || 0, s.owned_max || 0, ...Object.keys(vols).filter((v) => vols[v]).map(Number));
+  const recheck = !s.latest || s.status === "done"; // première fois, ou revérification tous les 3 jours (nouveaux tomes)
+  if (recheck) {
+    let lo = latest, hi = 0;
+    for (const step of [1, 2, 4, 8, 16, 32, 64]) {
+      if (Date.now() > deadline) break;
+      stats.probes++;
+      if (await probe(lo + step)) { latest = lo + step; } else { hi = lo + step; break; }
+    }
+    // entre le dernier trouvé et le premier manquant
+    for (let v = latest + 1; hi && v < hi && Date.now() < deadline; v++) { stats.probes++; if (await probe(v)) latest = v; else break; }
+  }
+  // 2) ISBN des tomes 1..dernier qui manquent (8 par passage)
+  const missing: number[] = [];
+  for (let v = 1; v <= latest; v++) if (!(String(v) in vols)) missing.push(v);
+  const work = missing.slice(0, 8);
+  await Promise.all([0, 1, 2, 3].map(async () => {
+    while (work.length && Date.now() < deadline) {
+      const v = work.shift()!; stats.probes++;
+      const ok = await probe(v);
+      if (!ok) vols[String(v)] = null; else stats.isbns++;
+    }
+  }));
+  // 3) fiche complète (classement, couverture…) des tomes pas encore en mémoire (3 par passage)
+  const isbns = Object.values(vols).filter(Boolean) as string[];
+  const known = new Set<string>();
+  for (let i = 0; i < isbns.length; i += 200) {
+    const { data } = await db.from("book_cache").select("isbn, data->v").in("isbn", isbns.slice(i, i + 200));
+    for (const r of data || []) if ((r as any).v == CACHE_V) known.add(r.isbn);
+  }
+  const todo = isbns.filter((i) => !known.has(i));
+  const lw = todo.slice(0, 3);
+  await Promise.all(lw.map(async (i) => { if (Date.now() < deadline) { try { await cachedLookup(i); stats.lookups++; } catch { /* plus tard */ } } }));
+  const stillMissing = missing.some((v) => !(String(v) in vols));
+  const done = !stillMissing && todo.length <= lw.length;
+  await db.from("catalog_series").update({
+    vols, latest: latest || null, status: done ? "done" : "todo", updated_at: new Date().toISOString(),
+    next_check: new Date(Date.now() + (done ? 3 * 864e5 : 0)).toISOString(),
+  }).eq("key", s.key);
+  return stats;
+}
+// séries du catalogue qui correspondent à une recherche, avec la fiche de chaque tome
+async function catalogSearch(words: string[], pWords: string[], aWords: string[]) {
+  const w = [...words].sort((a, b) => b.length - a.length)[0] || "";
+  if (!w) return [];
+  const { data } = await db.from("catalog_series").select("key, name, publisher, latest, vols, status").ilike("name", "%" + w.replace(/[%_]/g, "") + "%").limit(30);
+  const hit = (data || []).filter((r: any) => {
+    const n = " " + norm(r.name) + " ";
+    return words.every((x) => n.includes(" " + x)) && (!pWords.length || pWords.every((x) => (" " + norm(r.publisher) + " ").includes(" " + x)));
+  });
+  const out: any[] = [];
+  for (const r of hit.slice(0, 8)) {
+    const entries = Object.entries(r.vols || {}).filter(([, i]) => i) as [string, string][];
+    if (entries.length < 2) continue;
+    const { data: cache } = await db.from("book_cache").select("isbn, data").in("isbn", entries.map(([, i]) => i));
+    const by = new Map((cache || []).map((c: any) => [c.isbn, c.data]));
+    const vols = entries.map(([v, i]) => { const d: any = by.get(i) || {}; return { isbn: i, volume: +v, title: d.title || r.name + " – Tome " + v, cover: d.cover || "", date: d.publishedDate || "" }; })
+      .sort((a, b) => a.volume - b.volume);
+    const d1: any = by.get(vols[0].isbn) || [...by.values()][0] || {};
+    if (aWords.length && !aWords.every((x) => (" " + norm(d1.authors || "") + " ").includes(" " + x))) continue;
+    const v1 = vols.find((v) => v.cover) || vols[0];
+    out.push({ name: r.name, publisher: r.publisher || d1.publisher || "", authors: d1.authors || "", cover: v1.cover, count: vols.length, maxVol: vols[vols.length - 1].volume,
+      kind: d1.category || "", format: d1.format || "", vols, catalog: true, complete: r.status === "done" });
+  }
+  return out;
 }
 
 // ---------- Tomes d'une série (sans ISBN) ----------
@@ -876,9 +1023,11 @@ async function releasesForSeries(name: string, books: any[], report: any) {
     if (better) byVol.set(r.volume, { ...(prev || {}), ...r, cover: r.cover || prev?.cover || "", sources: [...new Set([...(prev?.sources || []), r.src])] });
     else if (!special(r.title)) prev.sources = [...new Set([...(prev.sources || []), r.src])];
   };
-  // 1) Dernier tome déjà paru (BnF) : les prochains numéros sont juste après
+  // 1) Dernier tome déjà paru (catalogue, sinon BnF) : les prochains numéros sont juste après
   let latest = maxOwned;
-  if (maxOwned) {
+  const { data: cat } = await db.from("catalog_series").select("latest, updated_at").eq("key", catKey(name, last?.publisher || "")).maybeSingle();
+  if (cat?.latest && Date.now() - new Date(cat.updated_at).getTime() < 4 * 864e5) latest = Math.max(maxOwned, cat.latest);
+  else if (maxOwned) {
     let ref: any = null;
     if (last?.isbn) { try { ref = await srcBnf(last.isbn); } catch { /* sans référence */ } }
     if (!ref) ref = { publisher: last?.publisher || "" };
@@ -1049,6 +1198,8 @@ async function frLatest(name: string, books: any[]) {
   const vols = books.map((b) => b.volume).filter(Boolean);
   const maxOwned = vols.length ? Math.max(...vols) : 0;
   if (!maxOwned) return 0;
+  const { data: cat } = await db.from("catalog_series").select("latest, updated_at").eq("key", catKey(name, (books[0] || {}).publisher || "")).maybeSingle();
+  if (cat?.latest && Date.now() - new Date(cat.updated_at).getTime() < 4 * 864e5) return Math.max(maxOwned, cat.latest);
   const key = norm(name);
   const last = books.filter((b) => b.volume === maxOwned).find((b) => b.isbn) || books[0];
   let ref: any = null;
@@ -1098,7 +1249,31 @@ async function searchBooks(input: any) {
   if (q.length < 2 && au.length < 2 && pubQ.length < 2) return { series: [], books: [] };
   const key = "search" + SEARCH_V + "|" + [q, au, pubQ, volQ || "", catQ, fmtQ].join("|").replace(/\|+$/, "");
   const { data: c } = await db.from("series_cache").select("data, checked_at").eq("key", key).maybeSingle();
-  if (c && Date.now() - new Date(c.checked_at).getTime() < SEARCH_TTL) return c.data;
+  const fresh = c && Date.now() - new Date(c.checked_at).getTime() < SEARCH_TTL;
+  // le catalogue (préparé à l'avance) répond tout de suite ; la recherche chez les libraires complète en arrière-plan
+  if (!P._live && !volQ) {
+    const cat = await catalogSearch(words, pWords, aWords).catch(() => []);
+    const okK = (k: string) => !catQ || !k || k === catQ, okF = (f: string) => !fmtQ || !f || f === fmtQ;
+    const catOk = cat.filter((x: any) => okK(x.kind) && okF(x.format));
+    if (catOk.length) {
+      const base = fresh ? c.data : { series: [], books: [] };
+      const keys = new Set(catOk.map((x: any) => catKey(x.name, x.publisher)));
+      const rest = (base.series || []).filter((x: any) => !keys.has(catKey(x.name, x.publisher)));
+      // tomes trouvés chez les libraires mais pas encore dans le catalogue
+      for (const x of catOk) {
+        const live = (base.series || []).find((y: any) => catKey(y.name, y.publisher) === catKey(x.name, x.publisher));
+        for (const v of live?.vols || []) if (!x.vols.some((u: any) => u.volume === v.volume)) x.vols.push(v);
+        x.vols.sort((a: any, b: any) => a.volume - b.volume); x.count = x.vols.length; x.maxVol = x.vols[x.vols.length - 1].volume;
+      }
+      if (!fresh) {
+        const live = searchBooks({ ...P, _live: true }).catch(() => null);
+        // @ts-ignore EdgeRuntime existe sur Supabase
+        if (typeof EdgeRuntime !== "undefined" && EdgeRuntime.waitUntil) EdgeRuntime.waitUntil(live);
+      }
+      return { series: catOk.concat(rest).slice(0, 12), books: base.books || [], fromCatalog: true };
+    }
+  }
+  if (fresh) return c.data;
   // chaque mot tapé doit être le début d'un mot du titre (« sol » trouve « Solo », pas « Consolation »)
   const matches = (t: string) => { const n = " " + norm(t) + " "; return words.every((w) => n.includes(" " + w)); };
   const hasAll = (t: string, ws: string[]) => { const n = " " + norm(t) + " "; return ws.every((w) => n.includes(" " + w)); };
@@ -1204,6 +1379,7 @@ async function searchBooks(input: any) {
   await Promise.all(Array.from({ length: 12 }, worker));
   for (const x of out.series as any[]) { const v1 = x.vols.find((v: any) => v.cover); x.cover = v1 ? v1.cover : ""; }
   out.series.forEach((s: any) => delete s.rank);
+  catalogSeed(out.series.slice(0, 4).filter((x: any) => x.kind !== "roman" || !pubIn(LN_PUB, x.publisher)).flatMap((x: any) => x.vols.map((v: any) => ({ name: x.name, publisher: x.publisher, isbn: v.isbn, volume: v.volume })))).catch(() => {});
   if (found.length) await db.from("series_cache").upsert({ key, data: out, checked_at: new Date().toISOString() });
   return out;
 }
@@ -1267,7 +1443,7 @@ Deno.serve(async (req) => {
     const action = body.action || new URL(req.url).searchParams.get("action");
 
     if (action === "ping") return json({ ok: true });
-    if (action === "lookup") return json(await cachedLookup(body.isbn));
+    if (action === "lookup") return json(await cachedLookup(body.isbn, !!body.fast));
     if (action === "lookupMany") {
       const isbns = (body.isbns || []).slice(0, 8);
       const out: Record<string, any> = {};
@@ -1324,6 +1500,15 @@ Deno.serve(async (req) => {
         if (typeof EdgeRuntime !== "undefined" && EdgeRuntime.waitUntil) EdgeRuntime.waitUntil(task); else await task;
       }
       return json({ ...(cur || { releases: [] }), refreshing });
+    }
+    if (action === "crawl") {
+      const { data: cfg } = await db.from("app_config").select("value").eq("key", "cron_key").maybeSingle();
+      if (!cfg || req.headers.get("x-cron-key") !== cfg.value) return json({ error: "interdit" }, 403);
+      const deadline = Date.now() + 40000;
+      const seeded = await catalogSeedLibraries().catch(() => 0);
+      const done: any[] = [];
+      while (Date.now() < deadline - 8000) { const st = await crawlStep(deadline); if (!st) break; done.push(st); }
+      return json({ seeded, done });
     }
     if (action === "cron") {
       const { data: cfg } = await db.from("app_config").select("value").eq("key", "cron_key").maybeSingle();
