@@ -797,8 +797,8 @@
       missing.length ? (missing.length === 1 ? `Il te manque le tome ${missing[0]}.` : `Il te manque ${missing.length} tomes (${volRange(missing)}).`) : 'Tu as tous les tomes parus en France.');
     if (info && info.originCount && !originFr) {
       const behind = info.originCount - fr;
-      bars += bar('Parution en France', `${fr} sur ${info.originCount} tomes`, fr / info.originCount * 100, 'fr',
-        behind > 0 ? `La France a ${behind} tome${behind > 1 ? 's' : ''} de retard sur l’édition d’origine.` : behind < 0 ? `L’édition française est découpée en plus de tomes que l’originale (${info.originCount}).` : 'La France est à jour.');
+      bars += bar('Parution en France', behind < 0 ? `${fr} tomes` : `${fr} sur ${info.originCount} tomes`, fr / info.originCount * 100, 'fr',
+        behind > 0 ? `La France a ${behind} tome${behind > 1 ? 's' : ''} de retard sur l’édition d’origine.` : behind < 0 ? `L’édition française compte plus de tomes que l’originale (${info.originCount}) : les chapitres y sont répartis autrement.` : 'La France est à jour.');
       bars += bar('Parution ' + inOrigin, `${info.originCount} tomes`, 100, info.originFinished ? 'done' : 'origin',
         info.originFinished ? 'Série terminée ' + inOrigin + '.' : 'Série toujours en cours ' + inOrigin + '.');
     } else if (info && info.originFinished != null) {
