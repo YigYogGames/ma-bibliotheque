@@ -661,15 +661,36 @@
     try {
       // livres sans catégorie, ou sans type (manga, roman, light novel…) : détection faite par le serveur
       const recheck = (b) => !b.recat14 && !b.catManual && b.category === 'roman' && b.format !== 'Light novel' && !LN_RE.test(b.series || '') && guessCategory([b.publisher]) === 'manga';
-      const todo = state.books.filter((b) => b.isbn && ((!b.category && !b.catTriedAt) || (!b.format && !b.fmtTriedAt) || (b.price == null && !b.priceTriedAt) || recheck(b)));
+      // v0.15 : tomes de manga pris pour des light novels (« One piece (roman) »), hors-séries comptés comme un tome (deux « tome 3 »)
+      const dup = new Set(); const seen = new Map();
+      for (const b of state.books) if (b.series && b.volume) { const k = norm(b.series) + '#' + b.volume; if (seen.has(k)) { dup.add(b); dup.add(seen.get(k)); } else seen.set(k, b); }
+      const recheck15 = (b) => !b.recat15 && b.isbn && (LN_RE.test(b.series || '') || b.format === 'Light novel' || dup.has(b));
+      const todo = state.books.filter((b) => b.isbn && ((!b.category && !b.catTriedAt) || (!b.format && !b.fmtTriedAt) || (b.price == null && !b.priceTriedAt) || recheck(b) || recheck15(b)));
       for (let i = 0; i < todo.length; i += 6) {
         const chunk = todo.slice(i, i + 6);
         let res = {};
         try { res = (await api('lookupMany', { isbns: chunk.map((b) => b.isbn) }, 90000)).books || {}; } catch (e) { break; }
         for (const b of chunk) {
           const f = res[b.isbn];
-          const rc = recheck(b);
+          const rc = recheck(b), rc15 = recheck15(b);
           b.catTriedAt = b.fmtTriedAt = b.priceTriedAt = Date.now();
+          if (f) b.recat15 = 1;
+          if (f && rc15) {
+            const base = (x) => norm(String(x || '').replace(LN_RE, ''));
+            // le serveur ne voit plus un light novel : on retire « (roman) » et on remet le tome avec les autres
+            if (LN_RE.test(b.series || '') && f.format !== 'Light novel' && !LN_RE.test(f.series || '')) {
+              const old = b.series, nm = old.replace(LN_RE, '');
+              const ex = seriesList().find((x) => x.key === norm(nm)); b.series = ex ? ex.name : nm;
+              if (b.title && b.title.startsWith(old)) b.title = b.series + b.title.slice(old.length);
+              if (f.format) b.format = f.format;
+              if (f.category && !b.catManual) b.category = f.category;
+            }
+            // hors-série (« One piece – 500 quiz book ») qui était rangé comme un tome de la série
+            else if (f.series && norm(f.series) !== base(b.series) && norm(f.series).startsWith(base(b.series) + ' ')) {
+              b.series = f.series; if (f.volume) b.volume = f.volume; if (f.title) b.title = f.title;
+            }
+            else if (f.format === 'Light novel' && b.format !== 'Light novel') b.format = f.format;
+          }
           if (f) b.recat14 = 1;
           if (f && f.format && (!b.format || rc)) b.format = f.format;
           if (f && f.genre && !b.genre) b.genre = f.genre;
@@ -1225,11 +1246,14 @@
   }
 
   // ---------- Feuille modale ----------
-  function openSheet(html) {
-    $('#sheetBody').innerHTML = html;
+  function openSheet(html, keepScroll) {
+    const body = $('#sheetBody'), box = body.parentElement;
+    const st = keepScroll ? [body.scrollTop, box.scrollTop] : null;
+    body.innerHTML = html;
     $('#sheetBackdrop').hidden = false;
-    document.body.style.setProperty('--sy', scrollY + 'px');
+    if (!document.body.classList.contains('sheet-open')) document.body.style.setProperty('--sy', scrollY + 'px');
     document.body.classList.add('sheet-open');
+    if (st) { body.scrollTop = st[0]; box.scrollTop = st[1]; }
   }
   function closeSheet() { $('#sheetBackdrop').hidden = true; $('#sheetBody').innerHTML = ''; document.body.classList.remove('sheet-open'); }
 
@@ -1873,7 +1897,9 @@
     const own = ownedIsbns();
     const sCat = s.kind || null;
     const ownedVols = new Set(state.books.filter((b) => norm(b.series.replace(/\s*\([^)]*\)\s*$/, '')) === norm(s.name) && samePub(b.publisher || '', s.publisher || '') && (!sCat || catOf(b) === sCat) && !b.isbn).map((b) => b.volume));
-    const isOwned = (v) => own.has(v.isbn) || ownedVols.has(v.volume);
+    const isOwned = (v) => (v.isbn && own.has(v.isbn)) || ownedVols.has(v.volume) ||
+      (!v.isbn && state.books.some((b) => b.volume === v.volume && norm(b.series.replace(/\s*\([^)]*\)\s*$/, '')) === norm(s.name) && samePub(b.publisher || '', s.publisher || '')));
+    const vkey = (v) => v.isbn || 'v' + v.volume;
     const picked = new Set();
     if (!s.cat) {
       const ownedBook = state.books.find((b) => norm(b.series) === norm(s.name) && b.category && samePub(b.publisher || '', s.publisher || ''));
@@ -1881,31 +1907,31 @@
     }
     const draw = () => {
       const vols = s.vols;
-      const free = vols.filter((v) => !isOwned(v));
+      const free = vols.filter((v) => !isOwned(v) && !v.pending);
       openSheet(`<button class="as-back" id="asBack">‹ Retour</button>
         <div class="as-shead">${thumbHTML(s)}<div><h2>${esc(s.name)}</h2>
           <p class="muted small">${esc([s.publisher, s.authors].filter(Boolean).join(' · '))}</p>
-          <p class="muted small" id="asMore">${vols.length} tome${vols.length > 1 ? 's' : ''} trouvé${vols.length > 1 ? 's' : ''}${s.more ? '' : ' · recherche des autres tomes…'}</p></div></div>
-        <div class="as-tools"><span>Touche les tomes à ajouter</span>${free.length ? `<button class="as-link" id="asAll">${free.every((v) => picked.has(v.isbn)) ? 'Tout décocher' : 'Tout cocher'}</button>` : ''}</div>
+          <p class="muted small" id="asMore">${vols.filter((v) => v.isbn).length} tome${vols.length > 1 ? 's' : ''} trouvé${vols.length > 1 ? 's' : ''}${s.filling ? ' · recherche des tomes manquants…' : s.more ? '' : ' · recherche des autres tomes…'}</p></div></div>
+        <div class="as-tools"><span>Touche les tomes à ajouter</span>${free.length ? `<button class="as-link" id="asAll">${free.every((v) => picked.has(vkey(v))) ? 'Tout décocher' : 'Tout cocher'}</button>` : ''}</div>
         <div class="as-grid">${vols.map((v) => {
           const o = isOwned(v);
-          return `<button class="as-vol ${o ? 'own' : picked.has(v.isbn) ? 'on' : ''}" data-isbn="${esc(v.isbn)}" ${o ? 'disabled' : ''}>
+          return `<button class="as-vol ${o ? 'own' : picked.has(vkey(v)) ? 'on' : ''} ${v.pending ? 'pending' : ''}" data-isbn="${esc(vkey(v))}" ${o || v.pending ? 'disabled' : ''}>
             ${coverHTML({ cover: v.cover, title: v.title, series: s.name })}<span class="as-num">${v.volume}</span>
             ${o ? '<span class="as-tick own">✓</span>' : '<span class="as-tick"></span>'}</button>`;
         }).join('')}</div>
         ${catPickerHTML(s.cat)}
-        <div class="sheet-actions"><button class="btn primary block" id="asAddSel" ${picked.size ? '' : 'disabled'}>${picked.size ? `Ajouter ${picked.size} tome${picked.size > 1 ? 's' : ''}` : 'Choisis des tomes'}</button></div>`);
+        <div class="sheet-actions"><button class="btn primary block" id="asAddSel" ${picked.size ? '' : 'disabled'}>${picked.size ? `Ajouter ${picked.size} tome${picked.size > 1 ? 's' : ''}` : 'Choisis des tomes'}</button></div>`, !!$('#asBack'));
       $('#asBack').onclick = () => (onBack ? onBack() : closeSheet());
-      if ($('#asAll')) $('#asAll').onclick = () => { const all = free.every((v) => picked.has(v.isbn)); free.forEach((v) => all ? picked.delete(v.isbn) : picked.add(v.isbn)); draw(); };
+      if ($('#asAll')) $('#asAll').onclick = () => { const all = free.every((v) => picked.has(vkey(v))); free.forEach((v) => all ? picked.delete(vkey(v)) : picked.add(vkey(v))); draw(); };
       $$('.as-vol:not([disabled])', $('#sheetBody')).forEach((el) => el.onclick = () => {
         const i = el.dataset.isbn; picked.has(i) ? picked.delete(i) : picked.add(i);
         el.classList.toggle('on', picked.has(i));
         const btn = $('#asAddSel'); btn.disabled = !picked.size;
         btn.textContent = picked.size ? `Ajouter ${picked.size} tome${picked.size > 1 ? 's' : ''}` : 'Choisis des tomes';
-        const all = $('#asAll'); if (all) all.textContent = free.every((v) => picked.has(v.isbn)) ? 'Tout décocher' : 'Tout cocher';
+        const all = $('#asAll'); if (all) all.textContent = free.every((v) => picked.has(vkey(v))) ? 'Tout décocher' : 'Tout cocher';
       });
       wireCatPicker((c) => { s.cat = c; s.catTouched = true; });
-      $('#asAddSel').onclick = () => addManyIsbns(vols.filter((v) => picked.has(v.isbn)), s);
+      $('#asAddSel').onclick = () => addManyIsbns(vols.filter((v) => picked.has(vkey(v))), s);
     };
     draw();
     // les tomes qui manquent dans la première recherche : on cherche le nom exact de la série
@@ -1918,6 +1944,30 @@
       } catch (e) { /* on garde ce qu'on a */ }
     }
     s.more = true;
+    if ($('#asBack')) draw();
+    // les numéros qui manquent encore (la recherche des libraires s'arrête à ~60 livres) : demandés un par un à la BnF / Google
+    const have = new Set(s.vols.map((v) => v.volume));
+    const maxV = Math.max(0, ...s.vols.map((v) => v.volume || 0));
+    const missing = []; for (let n = 1; n <= maxV && missing.length < 150; n++) if (!have.has(n)) missing.push(n);
+    if (!missing.length || s.filled) return;
+    s.filled = true; s.filling = true;
+    for (const n of missing) s.vols.push({ volume: n, isbn: '', title: s.name + ' – Tome ' + n, cover: '', pending: true });
+    s.vols.sort((a, b) => a.volume - b.volume);
+    if ($('#asBack')) draw();
+    const ref = (s.vols.find((v) => v.isbn) || {}).isbn || '';
+    for (let i = 0; i < missing.length; i += 12) {
+      const part = missing.slice(i, i + 12);
+      let got = {};
+      try { got = (await api('volumes', { series: s.name, volumes: part, publisher: s.publisher || '', refIsbn: ref }, 90000)).volumes || {}; } catch (e) { /* on garde les cases vides */ }
+      for (const n of part) {
+        const v = s.vols.find((x) => x.volume === n && !x.isbn); if (!v) continue;
+        const r = got[n];
+        if (r && r.isbn && !s.vols.some((x) => x.isbn === r.isbn)) Object.assign(v, { isbn: r.isbn, title: r.title || v.title, cover: r.cover || '', date: r.publishedDate || '', pending: false });
+        else s.vols.splice(s.vols.indexOf(v), 1);
+      }
+      if ($('#asBack') && $('#asMore')) draw(); else return;
+    }
+    s.filling = false;
     if ($('#asBack')) draw();
   }
   const pubWordLocal = (p) => norm(p).split(' ').filter((w) => w.length > 2 && !['editions', 'edition', 'les', 'groupe'].includes(w))[0] || '';
@@ -1974,7 +2024,14 @@
     await Promise.all([worker(), worker(), worker()]);
     if (added.length) {
       const fmt = (added.find((b) => b.category === s.cat && b.format) || {}).format;
-      added.forEach((b) => { const was = b.category; applyCat(b, s.cat, !!s.catTouched); if (fmt && was !== s.cat) b.format = fmt; });
+      added.forEach((b) => {
+        const was = b.category; applyCat(b, s.cat, !!s.catTouched); if (fmt && was !== s.cat) b.format = fmt;
+        if (s.cat === 'manga' && LN_RE.test(b.series || '')) {
+          const old = b.series; b.series = old.replace(LN_RE, '');
+          if (b.title && b.title.startsWith(old)) b.title = b.series + b.title.slice(old.length);
+          if (b.format === 'Light novel') b.format = 'Manga';
+        }
+      });
       const others = state.books.filter((x) => !added.includes(x));
       const keep = state.books; state.books = others;
       const probe = Object.assign({}, added[0]); distinctSeries(probe);

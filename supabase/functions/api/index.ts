@@ -11,7 +11,7 @@ const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SE
   auth: { persistSession: false },
 });
 const GKEY = Deno.env.get("GOOGLE_BOOKS_KEY") || "";
-const CACHE_V = 10; // à augmenter quand la façon de lire les catalogues change
+const CACHE_V = 11; // à augmenter quand la façon de lire les catalogues change
 const clean = (b: any) => { if (!b) return b; const { _m, ...rest } = b; return rest; };
 
 const CORS = {
@@ -59,7 +59,7 @@ function isbn10to13(i: string) {
 
 function parseSeries(title: string, subtitle?: string) {
   const full = [title, subtitle].filter(Boolean).join(" - ");
-  const clean = (s: string) => s.replace(/[\s,.:\-–—(]+$/, "").trim();
+  const clean = (s: string) => s.replace(/[\s,.:\-–—(]+$/, "").replace(/[\s,.:\-–—(]+[ée]dition originale\)?$/i, "").replace(/[\s,.:\-–—(]+$/, "").trim();
   let m = full.match(/^(.*?)[\s,.:\-–—(]*\b(?:tome|tomes|t\.|t|vol\.?|volume|volumes|n°|no\.?|num[ée]ro|#)\s*(\d{1,4})\b/i);
   if (m && m[1].trim().length > 1) return { series: clean(m[1]), volume: +m[2] };
   m = full.match(/^(.*?)[\s,.:\-–—#]+(\d{1,3})\s*$/);
@@ -137,7 +137,11 @@ function parseUnimarc(rec) {
   const s225 = marcFields(rec, '225').find(isSeries225);
   const colls = marcFields(rec, '225').filter((f) => !isSeries225(f)).map((f) => norm(sub(f, 'a'))).filter(Boolean)
     .concat(marcFields(rec, '410').map((f) => norm(sub(f, 't'))).filter(Boolean));
-  if (s461) { series = sub(s461, 't'); volume = volNum(sub(s461, 'v')); }
+  if (s461) {
+    series = sub(s461, 't'); volume = volNum(sub(s461, 'v'));
+    // le titre du livre est le nom de la série + un sous-titre (« 500 quiz book », « Color walk »…) : c'est un hors-série
+    if (norm(main) === norm(series) && sub(t200, 'e') && !sub(t200, 'i')) series = series + ' – ' + sub(t200, 'e').replace(/^./, (c) => c.toUpperCase());
+  }
   else if (s225) { series = sub(s225, 'a'); volume = volNum(sub(s225, 'v')); }
   else if (volNum(sub(t200, 'h'))) { series = main; volume = volNum(sub(t200, 'h')); }
   const part = sub(t200, 'i') || (series && norm(main) !== norm(series) ? main : '');
@@ -154,10 +158,14 @@ function parseUnimarc(rec) {
   const cls = marcFields(rec, '686').map((f) => sub(f, 'a')).find(Boolean) || '';
   const origLang = marcFields(rec, '101').flatMap((f) => f.c || [])[0] || '';
   const drawn = /dessin|sc[ée]nario/i.test(sub(t200, 'f') + ' ' + sub(t200, 'g'));
-  const bookKind = cls === '805' || drawn ? 'manga' : /^80[0-46-9]$/.test(cls) ? 'roman'
+  // rayon « Bandes dessinées » ou collection manga (« Shonen manga ») : c'est un manga, même si la notice dit « texte »
+  const subj = marcFields(rec, '608').concat(marcFields(rec, '606')).map((f) => sub(f, 'a')).join(' ');
+  const drawnHint = / (bandes? dessinees?|mangas?|shonen|shonen manga|seinen|shojo|josei|comics|webtoons?|manhwas?) /.test(' ' + norm(subj + ' ' + colls.join(' ')) + ' ');
+  const novelWord = /light ?novel|\broman\b/i.test(main + ' ' + subt + ' ' + colls.join(' '));
+  const bookKind = cls === '805' || drawn || (drawnHint && !novelWord && !/^80[0-46-9]$/.test(cls)) ? 'manga' : /^80[0-46-9]$/.test(cls) ? 'roman'
     : contents.includes('sti') ? 'manga' : contents.includes('txt') ? 'roman' : '';
   const pubName = sub(marcFields(rec, '214')[0] || marcFields(rec, '210')[0], 'c');
-  const light = bookKind === 'roman' && (/light ?novel/i.test(main + ' ' + subt) || (isMangaPub(pubName) && ASIAN.includes(origLang)));
+  const light = bookKind === 'roman' && (/light ?novel/i.test(main + ' ' + subt) || (isMangaPub(pubName) && ASIAN.includes(origLang) && (novelWord || /^80[0-46-9]$/.test(cls))));
   if (light && series && !LN_RE.test(series)) {
     const old = series; series = series + LN_SUFFIX;
     if (title.startsWith(old)) title = series + title.slice(old.length);
@@ -178,7 +186,7 @@ function parseUnimarc(rec) {
     cover: hasCover && ark ? 'https://catalogue.bnf.fr/couverture?&appName=NE&idArk=' + ark + '&couverture=1' : '',
     series, volume, ark, subjects, collection: colls.join(', '), kind: bookKind, light, origLang, price: price || null,
     // « texte seul » (181) sans classement BD/roman : indice faible (la BnF le met aussi sur des mangas)
-    kindWeak: !(cls === '805' || drawn || /^80[0-46-9]$/.test(cls)),
+    kindWeak: !(cls === '805' || drawn || drawnHint || /^80[0-46-9]$/.test(cls)),
     // indices pour reconnaître la même édition (format, prix, collection) et écarter les produits dérivés
     _m: { main: norm(main), sub: norm(subt), colls, price, size },
   };
@@ -554,7 +562,7 @@ async function lookup(isbn: string) {
   };
   // Type de livre, du plus sûr au moins sûr : la notice BnF, le mot « roman » / « light novel » dans un titre, puis rayon et éditeur
   // (les rayons des libraires sont parfois faux : Leslibraires range le roman Solo Leveling en BD)
-  const titlesTxt = " " + norm(found.map((f: any) => f.title).join(" ")) + " ";
+  const titlesTxt = " " + norm(found.map((f: any) => String(f.title || "").replace(/\s*\(roman\)/gi, "")).join(" ")) + " ";
   const saysNovel = / (light novel|novel|roman) /.test(titlesTxt);
   // un « roman » de la BnF déduit du seul champ 181, chez un éditeur de mangas, sans le mot roman : c'est un manga
   const pubTxt = first(ll?.publisher, bnf?.publisher, pdl?.publisher, pickAll("publisher"));
@@ -953,7 +961,7 @@ async function seriesInfo(name: string, books: any[]) {
 // ---------- Recherche par titre (ajout sans code-barres) ----------
 // « solo » -> Solo Leveling (regroupé en série, tous les tomes trouvés), puis les autres livres dont le titre contient « solo »
 const SEARCH_TTL = 864e5;
-const SEARCH_V = 3; // version des résultats en mémoire
+const SEARCH_V = 4; // version des résultats en mémoire
 async function searchBooks(input: any) {
   // recherche simple (texte) ou avancée : titre, auteur, éditeur, tome, catégorie (roman / manga), type (Manga, Manhwa, BD…)
   const P = typeof input === "string" ? { q: input } : (input || {});

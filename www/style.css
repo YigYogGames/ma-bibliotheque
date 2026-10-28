@@ -892,3 +892,6 @@ html.scanning body::after { display: none; }
 .adv-seg button.on { background: var(--accent); color: var(--accent-text); }
 #advResults { margin-top: 6px; }
 #advResults .as-list { grid-template-columns: minmax(0, 1fr); }
+/* v0.15 : tome en cours de recherche */
+.as-vol.pending { opacity: .55; cursor: default; }
+.as-vol.pending::after { content: ""; position: absolute; left: 50%; top: 50%; width: 16px; height: 16px; margin: -8px 0 0 -8px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; animation: spin .9s linear infinite; color: var(--accent); }
