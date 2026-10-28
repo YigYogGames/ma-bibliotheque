@@ -605,8 +605,9 @@ main { padding-bottom: calc(100px + var(--safe-bottom)); }
 .as-hint { color: var(--muted); font-size: 13.5px; line-height: 1.5; text-align: center; padding: 22px 10px 8px; margin: 0; }
 .as-loading { display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--muted); font-size: 13.5px; padding: 28px 0 14px; }
 .as-h { margin: 18px 2px 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 700; }
-.as-list { display: grid; gap: 6px; }
-.as-row { display: flex; align-items: center; gap: 12px; width: 100%; padding: 8px 10px 8px 8px; border-radius: 14px; border: 1px solid var(--border);
+.as-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.as-gap { height: 8px; }
+.as-row { display: flex; align-items: center; gap: 12px; width: 100%; min-width: 0; box-sizing: border-box; overflow: hidden; padding: 8px 10px 8px 8px; border-radius: 14px; border: 1px solid var(--border);
   background: var(--surface); color: var(--text); text-align: left; font: inherit; cursor: pointer; }
 .as-row:active { transform: scale(.99); }
 .as-thumb { width: 44px; flex: 0 0 44px; aspect-ratio: 2/3; border-radius: 5px; overflow: hidden; background: var(--surface2); box-shadow: 0 2px 6px rgba(0,0,0,.25); }
@@ -643,3 +644,11 @@ main { padding-bottom: calc(100px + var(--safe-bottom)); }
 .as-tick.own { background: rgba(0,0,0,.55); }
 .sc-bottom { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
 .empty .btn { margin-top: 14px; }
+
+/* résultats en ligne sous la bibliothèque (v0.12.1) */
+#onlineHint { padding: 6px 14px 0; max-width: 720px; margin: 0 auto; box-sizing: border-box; width: 100%; }
+#onlineHint .as-h { margin-top: 20px; }
+#onlineHint .as-loading { padding: 18px 0; }
+.lib-none { text-align: center; color: var(--muted); font-size: 14px; margin: 18px 16px 0; }
+main { overflow-x: clip; }
+.as-main b { overflow-wrap: anywhere; }

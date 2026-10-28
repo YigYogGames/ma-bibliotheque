@@ -942,28 +942,39 @@
   }
 
   let libSig = '';
-  // Sous la bibliothèque, pendant une recherche : proposer de chercher le titre en ligne pour l'ajouter
+  // Pendant une recherche dans la barre du haut : les livres trouvés en ligne, à ajouter, sous ceux de la bibliothèque
+  let onlineQ = '', onlineTimer = null;
   function updateOnlineHint() {
     const h = $('#onlineHint'); if (!h) return;
     const q = $('#searchInput').value.trim();
-    h.hidden = norm(q).length < 2;
-    if (!h.hidden) h.innerHTML = `<button class="online-hint" id="onlineHintBtn">${SEARCH_ICON}<span>Chercher « ${esc(q)} » en ligne<small>pour l’ajouter à ta bibliothèque</small></span></button>`;
-    const b = $('#onlineHintBtn'); if (b) b.onclick = () => openAddSearch(q);
+    if (norm(q).length < 2) { h.hidden = true; h.innerHTML = ''; onlineQ = ''; clearTimeout(onlineTimer); return; }
+    if (norm(q) === onlineQ) return; // déjà affiché (ou en cours) pour cette recherche
+    onlineQ = norm(q);
+    h.hidden = false;
+    h.innerHTML = `<h3 class="as-h">À ajouter à ta bibliothèque</h3><div class="as-loading"><span class="mini-spin"></span>Recherche de « ${esc(q)} » chez les libraires…</div>`;
+    clearTimeout(onlineTimer);
+    onlineTimer = setTimeout(async () => {
+      const mine = onlineQ;
+      let res;
+      try { res = await searchOnline(q); }
+      catch (e) { if (mine === onlineQ) h.innerHTML = '<p class="as-hint">Pas de connexion : impossible de chercher en ligne pour l’instant.</p>'; return; }
+      if (mine !== onlineQ) return;
+      renderSearchResults(h, res, q);
+    }, 600);
   }
   function renderLibrary() {
     const el = $('#libraryContent');
     if (!catBooks().length) {
       const c = CATS[curCat()];
       libSig = '';
-      el.innerHTML = `<div class="empty"><div class="big">${c.icon}</div><h2>Pas encore de ${c.label.toLowerCase()}</h2>
-        <p>Appuie sur le gros bouton au centre en bas pour scanner le code-barres au dos d'un livre. Il sera rangé tout seul dans la bonne bibliothèque.</p>
-        <button class="btn" id="emptySearchBtn">🔎 Ou chercher un livre par son titre</button></div>`;
-      $('#emptySearchBtn').onclick = () => openAddSearch();
+      const q0 = $('#searchInput').value.trim();
+      el.innerHTML = norm(q0).length >= 2 ? '' : `<div class="empty"><div class="big">${c.icon}</div><h2>Pas encore de ${c.label.toLowerCase()}</h2>
+        <p>Appuie sur le gros bouton au centre en bas pour scanner le code-barres au dos d'un livre, ou tape un titre dans la barre de recherche en haut.</p></div>`;
       updateOnlineHint();
       return;
     }
     const list = sortedBooks();
-    if (!list.length) { libSig = ''; el.innerHTML = `<div class="empty"><p>Aucun livre ne correspond à ta recherche.</p></div>`; updateOnlineHint(); return; }
+    if (!list.length) { libSig = ''; el.innerHTML = `<p class="lib-none">« ${esc($('#searchInput').value.trim())} » n’est pas dans ta bibliothèque.</p>`; updateOnlineHint(); return; }
     updateOnlineHint();
     const layout = state.settings.layout;
     const sig = [layout, openPile, infoVer, curTheme(), window.innerWidth, list.map((b) => b.id + ':' + (b.cover || '') + ':' + b.volume + ':' + (b.title || '')).join(',')].join('|');
@@ -1213,6 +1224,7 @@
   }
 
   function addBook(b) {
+    onlineQ = '';
     Object.assign(b, { id: uid(), addedAt: Date.now() });
     delete b.incomplete;
     if (!b.category) b.category = catOf(b);
@@ -1520,7 +1532,7 @@
     renderScanList();
     $('#scClose').onclick = () => finishScan();
     $('#scManual').onclick = async () => { await finishScan(); askIsbn(); };
-    $('#scSearch').onclick = async () => { await finishScan(); openAddSearch(); };
+    $('#scSearch').onclick = async () => { await finishScan(); openAddSearch(''); };
     if ($('#scDone')) $('#scDone').onclick = () => finishScan();
     $('#scTorch').onclick = async () => {
       try {
@@ -1682,60 +1694,44 @@
   const year = (d) => (String(d || '').match(/\d{4}/) || [''])[0];
   function thumbHTML(r) { return `<div class="as-thumb">${coverHTML({ cover: r.cover, title: r.title || r.name, authors: r.authors, series: r.series || r.name })}</div>`; }
 
+  // Toute recherche d'ajout passe par la barre de recherche en haut de la bibliothèque
   function openAddSearch(initial) {
-    openSheet(`<h2>Ajouter un livre</h2>
-      <div class="as-field"><input type="search" id="asInput" placeholder="Titre, série ou auteur" autocomplete="off" enterkeyhint="search" value="${esc(initial || '')}"></div>
-      <div id="asResults"><p class="as-hint">Tape le début d’un titre : « Solo » propose Solo Leveling et tous les livres dont le titre contient « solo ».</p></div>
-      <div class="as-foot"><button class="btn ghost" type="button" id="asIsbn">Saisir un ISBN</button><button class="btn ghost" type="button" data-act="close">Fermer</button></div>`);
-    const input = $('#asInput');
-    let t;
-    input.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => runAddSearch(input.value), 450); });
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); clearTimeout(t); input.blur(); runAddSearch(input.value); } });
-    $('#asIsbn').onclick = () => askIsbn();
-    setTimeout(() => input.focus(), 150);
-    if (initial) runAddSearch(initial);
+    closeSheet();
+    if (currentView !== 'library') show('library');
+    const i = $('#searchInput');
+    if (initial != null) i.value = initial;
+    renderLibrary();
+    window.scrollTo(0, 0);
+    setTimeout(() => i.focus(), 100);
   }
 
-  async function runAddSearch(raw) {
-    const q = String(raw || '').trim();
-    const box = $('#asResults');
-    if (!box) return;
-    if (norm(q).length < 2) { box.innerHTML = '<p class="as-hint">Tape au moins 2 lettres.</p>'; return; }
-    const seq = ++searchSeq;
-    box.innerHTML = `<div class="as-loading"><span class="mini-spin"></span>Recherche de « ${esc(q)} » chez les libraires…</div>`;
-    let res;
-    try { res = await searchOnline(q); }
-    catch (e) { if (seq === searchSeq && $('#asResults')) $('#asResults').innerHTML = '<p class="as-hint">Pas de connexion. Réessaie dans un instant.</p>'; return; }
-    if (seq !== searchSeq || !$('#asResults')) return;
+  function renderSearchResults(box, res, q) {
     const own = ownedIsbns();
-    const series = res.series || [], books = res.books || [];
+    const series = res.series || [];
+    const books = (res.books || []).filter((b) => !own.has(b.isbn)); // ceux qu'on a déjà sont affichés au-dessus
+    let html = '<h3 class="as-h">À ajouter à ta bibliothèque</h3>';
     if (!series.length && !books.length) {
-      $('#asResults').innerHTML = `<p class="as-hint">Aucun livre trouvé pour « ${esc(q)} ». Vérifie l’orthographe, ou essaie avec le nom de l’auteur.</p>`;
+      box.innerHTML = html + `<p class="as-hint">Rien trouvé en ligne pour « ${esc(q)} ». Vérifie l’orthographe, ou essaie avec le nom de l’auteur.</p>`;
       return;
     }
-    let html = '';
     if (series.length) {
-      html += '<h3 class="as-h">Séries</h3><div class="as-list">' + series.map((s, i) => {
+      html += '<div class="as-list">' + series.map((s, i) => {
         const mine = s.vols.filter((v) => own.has(v.isbn)).length;
         return `<button class="as-row" data-as-series="${i}">${thumbHTML(s)}
           <span class="as-main"><b>${esc(s.name)}</b><span>${esc([s.publisher, s.authors].filter(Boolean).join(' · '))}</span>
-          <span class="as-meta">${s.count} tome${s.count > 1 ? 's' : ''} trouvé${s.count > 1 ? 's' : ''}${mine ? ` · ${mine} chez toi` : ''}</span></span>
+          <span class="as-meta">Série · ${s.count} tome${s.count > 1 ? 's' : ''}${mine ? ` · ${mine} chez toi` : ''}</span></span>
           <span class="as-chev" aria-hidden="true">›</span></button>`;
       }).join('') + '</div>';
     }
     if (books.length) {
-      html += `<h3 class="as-h">${series.length ? 'Autres livres' : 'Livres'}</h3><div class="as-list">` + books.map((b, i) => `
+      html += `${series.length ? '<div class="as-gap"></div>' : ''}<div class="as-list">` + books.map((b, i) => `
         <button class="as-row" data-as-book="${i}">${thumbHTML(b)}
           <span class="as-main"><b>${esc(b.title)}</b><span>${esc([b.authors, b.publisher, year(b.date)].filter(Boolean).join(' · '))}</span></span>
-          ${own.has(b.isbn) ? '<span class="as-owned">✓ Chez toi</span>' : '<span class="as-add" aria-label="Ajouter">＋</span>'}</button>`).join('') + '</div>';
+          <span class="as-add" aria-label="Ajouter">＋</span></button>`).join('') + '</div>';
     }
-    $('#asResults').innerHTML = html;
-    $$('[data-as-series]', $('#asResults')).forEach((el) => el.onclick = () => openSearchSeries(series[+el.dataset.asSeries], q));
-    $$('[data-as-book]', $('#asResults')).forEach((el) => el.onclick = () => {
-      const b = books[+el.dataset.asBook];
-      if (own.has(b.isbn)) { const ex = state.books.find((x) => x.isbn === b.isbn); if (ex) openBook(ex.id); return; }
-      handleCode(b.isbn);
-    });
+    box.innerHTML = html;
+    $$('[data-as-series]', box).forEach((el) => el.onclick = () => openSearchSeries(series[+el.dataset.asSeries], q));
+    $$('[data-as-book]', box).forEach((el) => el.onclick = () => handleCode(books[+el.dataset.asBook].isbn));
   }
 
   // Une série trouvée : tous ses tomes, à cocher puis ajouter d'un coup
@@ -1747,7 +1743,7 @@
     const draw = () => {
       const vols = s.vols;
       const free = vols.filter((v) => !isOwned(v));
-      openSheet(`<button class="as-back" id="asBack">‹ Résultats</button>
+      openSheet(`<button class="as-back" id="asBack">‹ Retour</button>
         <div class="as-shead">${thumbHTML(s)}<div><h2>${esc(s.name)}</h2>
           <p class="muted small">${esc([s.publisher, s.authors].filter(Boolean).join(' · '))}</p>
           <p class="muted small" id="asMore">${vols.length} tome${vols.length > 1 ? 's' : ''} trouvé${vols.length > 1 ? 's' : ''}${s.more ? '' : ' · recherche des autres tomes…'}</p></div></div>
@@ -1759,7 +1755,7 @@
             ${o ? '<span class="as-tick own">✓</span>' : '<span class="as-tick"></span>'}</button>`;
         }).join('')}</div>
         <div class="sheet-actions"><button class="btn primary block" id="asAddSel" ${picked.size ? '' : 'disabled'}>${picked.size ? `Ajouter ${picked.size} tome${picked.size > 1 ? 's' : ''}` : 'Choisis des tomes'}</button></div>`);
-      $('#asBack').onclick = () => openAddSearch(q);
+      $('#asBack').onclick = () => closeSheet();
       if ($('#asAll')) $('#asAll').onclick = () => { const all = free.every((v) => picked.has(v.isbn)); free.forEach((v) => all ? picked.delete(v.isbn) : picked.add(v.isbn)); draw(); };
       $$('.as-vol:not([disabled])', $('#sheetBody')).forEach((el) => el.onclick = () => {
         const i = el.dataset.isbn; picked.has(i) ? picked.delete(i) : picked.add(i);
@@ -1811,7 +1807,7 @@
       }
     };
     await Promise.all([worker(), worker(), worker()]);
-    seriesCatCache = null;
+    seriesCatCache = null; onlineQ = '';
     if (added.length && catOf(added[0]) !== curCat()) setCat(catOf(added[0]));
     save(); render();
     (async () => { for (const nb of added) { if (!nb.cover && nb.isbn) { const u = await findCoverAny(nb.isbn, nb.ark, nb).catch(() => ''); nb.coverTriedAt = Date.now(); if (u) { nb.cover = u; save(); scheduleRender(); } } } })();
@@ -1819,7 +1815,7 @@
       <p class="muted">${esc(s.name)}${cancelled ? ' (ajout arrêté en cours de route)' : ''}.</p>
       <div class="sheet-actions"><button class="btn primary block" id="asAgain">Chercher un autre livre</button>
       <button class="btn ghost block" data-act="close">Terminé</button></div>`);
-    $('#asAgain').onclick = () => openAddSearch();
+    $('#asAgain').onclick = () => openAddSearch('');
   }
 
   // Contrôle du code EAN-13 : évite les lectures erronées du scanner
@@ -2118,7 +2114,7 @@
     $('#layoutBtn').addEventListener('click', openLayoutMenu);
     $('#addReleaseBtn').addEventListener('click', addReleaseManually);
     $('#manualIsbnBtn').addEventListener('click', () => askIsbn());
-    $('#searchAddBtn').addEventListener('click', () => openAddSearch());
+    $('#searchAddBtn').addEventListener('click', () => openAddSearch(''));
     $('#manualBookBtn').addEventListener('click', () => {
       const b = { isbn: '', title: '', authors: '', publisher: '', publishedDate: '', cover: '', series: '', volume: null };
       openSheet(bookForm(b, { isNew: true })); wireBookForm(b, true);
