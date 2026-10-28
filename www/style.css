@@ -477,7 +477,7 @@ button, .book, .tab, .list-item, .rel, .theme-card, .cat-btn { touch-action: man
 
 /* ===== Nouvelle ambiance (v0.11) : lampe, en-tête centré, recherche ronde ===== */
 [data-theme="bois"] { --wall: radial-gradient(120% 55% at 50% 0%, #3a2a1d 0%, #221912 55%, #1a130e 100%); --bg2: #1d1510; }
-body { background-attachment: fixed; }
+
 .topbar { text-align: center; background: transparent; border-bottom: 0; padding-bottom: 4px; position: relative; }
 .topbar h1 { font-size: 30px; font-weight: 700; letter-spacing: .5px; }
 .topbar-sub { font-size: 12.5px; }
@@ -652,3 +652,11 @@ main { padding-bottom: calc(100px + var(--safe-bottom)); }
 .lib-none { text-align: center; color: var(--muted); font-size: 14px; margin: 18px 16px 0; }
 main { overflow-x: clip; }
 .as-main b { overflow-wrap: anywhere; }
+
+/* ===== iPhone en plein écran (v0.12.2) ===== */
+/* le décor est peint dans un calque fixe : Safari ne gère pas background-attachment: fixed et laissait une bande en bas */
+body { background: var(--bg); min-height: 100vh; min-height: 100dvh; }
+body::before { content: ""; position: fixed; inset: 0; z-index: -1; background: var(--wall); background-color: var(--bg); pointer-events: none; }
+html.scanning body::before { display: none; }
+/* barre du bas : centrée sans dépendre de la moitié de l'écran (sinon elle se rétrécit sur iPhone) */
+.tabbar { left: 0; right: 0; margin: 0 auto; width: max-content; max-width: calc(100% - 24px); transform: none; }

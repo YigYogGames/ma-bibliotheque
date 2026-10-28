@@ -11,7 +11,7 @@ const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SE
   auth: { persistSession: false },
 });
 const GKEY = Deno.env.get("GOOGLE_BOOKS_KEY") || "";
-const CACHE_V = 8; // à augmenter quand la façon de lire les catalogues change
+const CACHE_V = 9; // à augmenter quand la façon de lire les catalogues change
 const clean = (b: any) => { if (!b) return b; const { _m, ...rest } = b; return rest; };
 
 const CORS = {
@@ -177,6 +177,8 @@ function parseUnimarc(rec) {
     publisher: sub(pubF, 'c'), publishedDate: year, pages, description: sub(marcFields(rec, '330')[0], 'a'),
     cover: hasCover && ark ? 'https://catalogue.bnf.fr/couverture?&appName=NE&idArk=' + ark + '&couverture=1' : '',
     series, volume, ark, subjects, collection: colls.join(', '), kind: bookKind, light, origLang, price: price || null,
+    // « texte seul » (181) sans classement BD/roman : indice faible (la BnF le met aussi sur des mangas)
+    kindWeak: !(cls === '805' || drawn || /^80[0-46-9]$/.test(cls)),
     // indices pour reconnaître la même édition (format, prix, collection) et écarter les produits dérivés
     _m: { main: norm(main), sub: norm(subt), colls, price, size },
   };
@@ -512,11 +514,18 @@ async function lookup(isbn: string) {
   // (les rayons des libraires sont parfois faux : Leslibraires range le roman Solo Leveling en BD)
   const titlesTxt = " " + norm(found.map((f: any) => f.title).join(" ")) + " ";
   const saysNovel = / (light novel|novel|roman) /.test(titlesTxt);
-  const kind = bnf?.kind || (saysNovel ? "roman" : "");
+  // un « roman » de la BnF déduit du seul champ 181, chez un éditeur de mangas, sans le mot roman : c'est un manga
+  const pubTxt = first(ll?.publisher, bnf?.publisher, pdl?.publisher, pickAll("publisher"));
+  const weakRoman = bnf?.kind === "roman" && bnf?.kindWeak && isMangaPub(pubTxt) && !saysNovel && !/ light novel /.test(" " + norm(b.collection) + " ");
+  const kind = (weakRoman ? "" : bnf?.kind) || (saysNovel ? "roman" : "");
   b.category = kind || categorize([found.map((f: any) => [f.subjects, f.collection]), b.publisher, b.collection]);
   const origLang = bnf?.origLang || ll?.origLang || "";
   const light = b.category === "roman" && (bnf?.light || / light novel /.test(titlesTxt + norm(b.collection) + " ") ||
     (isMangaPub(b.publisher) && (saysNovel || ASIAN.includes(origLang))));
+  if (!light && LN_RE.test(b.series || "")) { // la BnF avait cru à un light novel
+    b.series = baseName(b.series);
+    if (b.volume) b.title = b.series + " – Tome " + b.volume;
+  }
   if (light && b.series && !LN_RE.test(b.series)) {
     b.series = baseName(b.series) + LN_SUFFIX;
     if (b.volume) b.title = b.series + " – Tome " + b.volume;

@@ -573,7 +573,8 @@
     classifying = true;
     try {
       // livres sans catégorie, ou sans type (manga, roman, light novel…) : détection faite par le serveur
-      const todo = state.books.filter((b) => b.isbn && ((!b.category && !b.catTriedAt) || (!b.format && !b.fmtTriedAt) || (b.price == null && !b.priceTriedAt)));
+      const recheck = (b) => !b.recat13 && !b.catManual && b.category === 'roman' && b.format !== 'Light novel' && !LN_RE.test(b.series || '') && guessCategory([b.publisher]) === 'manga';
+      const todo = state.books.filter((b) => b.isbn && ((!b.category && !b.catTriedAt) || (!b.format && !b.fmtTriedAt) || (b.price == null && !b.priceTriedAt) || recheck(b)));
       for (let i = 0; i < todo.length; i += 6) {
         const chunk = todo.slice(i, i + 6);
         let res = {};
@@ -581,7 +582,8 @@
         for (const b of chunk) {
           const f = res[b.isbn];
           b.catTriedAt = b.fmtTriedAt = b.priceTriedAt = Date.now();
-          if (f && f.format) b.format = f.format;
+          if (f) b.recat13 = 1;
+          if (f && f.format && (!b.format || recheck(b))) b.format = f.format;
           if (f && f.price && !b.price) b.price = f.price;
           // un light novel rangé avec le manga du même nom : on le met dans sa propre série « Nom (roman) »
           if (f && f.series && LN_RE.test(f.series) && b.series && !LN_RE.test(b.series) && norm(f.series.replace(LN_RE, '')) === norm(b.series)) {
@@ -1097,7 +1099,7 @@
         ${r.cover ? `<div class="thumb"><img src="${esc(r.cover)}" alt="" loading="lazy" onerror="this.parentNode.remove()"></div>` : ''}
         <div class="li-main"><div class="li-title">${esc(r.series)}${r.volume ? ' — Tome ' + r.volume : ''}</div>
           <div class="li-sub">${when(r.date)}${src ? ' · ' + esc(src) : ''}</div></div>
-        <button class="rel-x" data-dismiss="${r.id}" aria-label="Masquer">✕</button>
+
       </div>`;
     };
     // regroupement par mois
@@ -1227,6 +1229,8 @@
     onlineQ = '';
     Object.assign(b, { id: uid(), addedAt: Date.now() });
     delete b.incomplete;
+    const same = b.series && !b.catManual && state.books.find((x) => x.series && norm(x.series) === norm(b.series) && x.category);
+    if (same) b.category = same.category;
     if (!b.category) b.category = catOf(b);
     state.books.push(b);
     seriesCatCache = null;
@@ -1807,6 +1811,13 @@
       }
     };
     await Promise.all([worker(), worker(), worker()]);
+    if (added.length) {
+      const owned = state.books.find((x) => !added.includes(x) && x.series && norm(x.series) === norm(s.name) && x.category);
+      const cnt = {}; added.forEach((b) => { cnt[b.category] = (cnt[b.category] || 0) + 1; });
+      const cat = owned ? owned.category : Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0];
+      const fmt = (added.find((b) => b.category === cat && b.format) || {}).format;
+      added.forEach((b) => { if (b.category !== cat) { b.category = cat; if (fmt) b.format = fmt; } });
+    }
     seriesCatCache = null; onlineQ = '';
     if (added.length && catOf(added[0]) !== curCat()) setCat(catOf(added[0]));
     save(); render();
