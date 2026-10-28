@@ -493,28 +493,96 @@
 
   // ---------- Étagères (thèmes) ----------
   const THEMES = [
-    { id: 'bois', name: 'Bois', deco: [], hang: [], top: '', books: ['#8a5a33', '#c0392b', '#2f6d5a'] },
-    { id: 'nuit', name: 'Nuit', deco: ['🌙'], hang: ['⭐'], top: '', books: ['#3a4664', '#7aa2ff', '#9b59b6'] },
-    { id: 'papier', name: 'Papier', deco: [], hang: [], top: '', books: ['#b4462b', '#d9c6a5', '#2b2520'] },
-    { id: 'pastel', name: 'Pastel', deco: ['🌷'], hang: [], top: '', books: ['#f2c6d8', '#a978d6', '#9ad1c3'] },
-    { id: 'manga', name: 'Manga', deco: ['💥'], hang: [], top: '', books: ['#e8202a', '#111', '#888'] },
-    { id: 'dark-fantasy', name: 'Dark Fantasy', deco: ['🕯️', '💀', '🔮', '🗝️', '📜'], hang: ['⛓️', '🦇'], top: '🌙 ✦ 🕯️ ✦ 🌙', books: ['#4b2a6b', '#1f3b2e', '#6b1f2a'] },
-    { id: 'medieval', name: 'Médiéval Fantasy', deco: ['🛡️', '🗡️', '🍺', '👑', '🕯️', '📜'], hang: ['🏴', '🔥'], top: '⚜️ ⚔️ 🏰 ⚔️ ⚜️', books: ['#7a2a1f', '#2c4a2a', '#c9a227'] },
-    { id: 'japon', name: 'Japon', deco: ['🎎', '🍵', '🌸', '🎏', '🗻'], hang: ['🏮'], top: '🌸 ⛩️ 🌸', books: ['#c0392b', '#2a1d16', '#e8b4b8'] },
-    { id: 'halloween', name: 'Halloween', deco: ['🎃', '🕯️', '🧙', '🍬', '💀', '🧪'], hang: ['🦇', '🕷️', '🕸️'], top: '🕸️ 🎃 🦇 🎃 🕸️', books: ['#ff7a1a', '#3b1f5e', '#1a1a1a'] },
-    { id: 'cosy', name: 'Cosy', deco: ['🪴', '☕', '🕯️', '🧸', '🧶', '🍪'], hang: [], lights: true, top: '✨ 🪴 ✨', books: ['#c8743f', '#7a9a6a', '#e8c39e'] },
-  ];
+    { id: 'bois', name: 'Bois', desc: 'Lampe chaude et bois sombre', preview: 'radial-gradient(120% 70% at 50% 0%, #4a3523, #221912 60%, #1a130e)', ink: '#f3e6d3' },
+    { id: 'neon', name: 'Néon', desc: 'Synthwave sous la pluie', preview: 'linear-gradient(#07040f 40%, #3b0b55), radial-gradient(circle at 50% 70%, #ff4fa3 0 22%, transparent 23%)', ink: '#ffe6fb' },
+    { id: 'japon', name: 'Japon', desc: 'Washi, sakura et vagues', preview: 'radial-gradient(circle at 78% 30%, #d9473d 0 18%, transparent 19%), linear-gradient(#fbf5e9, #e9dcc2)', ink: '#2a211b' },
+    { id: 'grimoire', name: 'Grimoire', desc: 'Bougies, runes et poussière d’or', preview: 'radial-gradient(70% 50% at 50% 10%, rgba(159,123,255,.45), transparent 70%), linear-gradient(#120f24, #0a0813)', ink: '#f1e6c8' },
+    { id: 'lofi', name: 'Lo-fi', desc: 'Pluie sur la vitre, la nuit', preview: 'radial-gradient(circle at 30% 40%, rgba(255,143,177,.5) 0 10%, transparent 11%), radial-gradient(circle at 70% 55%, rgba(143,208,255,.45) 0 12%, transparent 13%), linear-gradient(#1b1d3a, #3a2b52)', ink: '#f3eefe' },
+    { id: 'ocean', name: 'Océan', desc: 'Rayons, bulles et méduses', preview: 'linear-gradient(170deg, rgba(160,240,255,.35) 0 12%, transparent 13% 30%, rgba(160,240,255,.25) 31% 36%, transparent 37%), linear-gradient(#0e4d70, #04192e 70%, #020b16)', ink: '#e8fbff' },
+  ].map((t) => Object.assign({ deco: [], hang: [], top: '', books: [] }, t));
+  // anciens décors -> le plus proche des nouveaux
+  const OLD_THEME = { 'dark-fantasy': 'grimoire', medieval: 'grimoire', halloween: 'grimoire', nuit: 'lofi', japon: 'japon', cosy: 'bois', papier: 'bois', pastel: 'bois', manga: 'bois' };
   const themeOf = (id) => THEMES.find((t) => t.id === id) || THEMES[0];
   function themeCardsHTML() {
-    return '<div class="theme-grid">' + THEMES.map((t) => `<button class="theme-card ${t.id === curTheme() ? 'active' : ''}" data-theme="${t.id}" data-pick-theme="${t.id}">
-      <span class="tc-wall">${t.books.map((c, i) => `<span class="tc-book" style="background:${c};height:${[52, 60, 46][i]}px"></span>`).join('')}<span class="tc-deco">${t.deco[0] || ''}</span></span>
-      <span class="tc-plank"></span><span class="tc-name">${esc(t.name)}</span></button>`).join('') + '</div>';
+    return '<div class="theme-grid">' + THEMES.map((t) => `<button class="theme-card ${t.id === curTheme() ? 'active' : ''}" data-pick-theme="${t.id}" style="background:${t.preview};color:${t.ink}">
+      <span class="tc-name" data-theme="${t.id}">${esc(t.name)}</span><span class="tc-desc">${esc(t.desc)}</span></button>`).join('') + '</div>';
   }
-  function curTheme() { const t = state.settings.themes || {}; return t[curCat()] || state.settings.theme || 'bois'; }
-  function pickTheme(id) { state.settings.themes = Object.assign({}, state.settings.themes, { [curCat()]: id }); save(); applyTheme(); render(); }
+
+  // ---------- Décors animés (calque fixe derrière l'appli) ----------
+  function seeded(seed) { let x = seed; return () => { x = (x * 16807) % 2147483647; return (x - 1) / 2147483646; }; }
+  const SCENES = {
+    bois: () => '<div class="sc-lamp"></div><div class="sc-dust"></div>',
+    neon(r) {
+      let rain = '';
+      for (let i = 0; i < 28; i++) rain += `<i class="nx-drop" style="left:${(r() * 100).toFixed(1)}%;height:${40 + r() * 70 | 0}px;animation-duration:${(.55 + r() * .5).toFixed(2)}s;animation-delay:-${(r() * 1.5).toFixed(2)}s;opacity:${(.15 + r() * .3).toFixed(2)}"></i>`;
+      return `<div class="nx-sky"></div><div class="nx-sun"></div><div class="nx-city"></div><div class="nx-floor"><div class="nx-grid"></div></div><div class="nx-scan"></div><div class="nx-rain">${rain}</div>`;
+    },
+    japon(r) {
+      let petals = '';
+      const cols = ['#f7b6c8', '#f9c9d6', '#f4a3bb', '#fbd5df'];
+      for (let i = 0; i < 14; i++) petals += `<svg class="jp-petal" style="left:${(r() * 100 - 5).toFixed(1)}%;width:${10 + r() * 8 | 0}px;animation-duration:${(7 + r() * 6).toFixed(1)}s,${(2.5 + r() * 2).toFixed(1)}s;animation-delay:-${(r() * 12).toFixed(1)}s,-${(r() * 4).toFixed(1)}s" viewBox="0 0 20 20"><path d="M10 1C6 5 4 9 6 14c1 3 3 5 4 5s3-2 4-5c2-5 0-9-4-13z" fill="${cols[i % 4]}"/></svg>`;
+      return `<div class="jp-washi"></div><div class="jp-sun"></div>
+        <svg class="jp-mount" viewBox="0 0 390 220" preserveAspectRatio="none"><path d="M0 160 L60 90 L95 120 L150 40 L210 125 L250 95 L300 140 L340 100 L390 150 L390 220 L0 220Z" fill="#2b3a55" opacity=".14"/><path d="M0 185 L80 130 L130 165 L190 110 L250 170 L320 135 L390 175 L390 220 L0 220Z" fill="#2b3a55" opacity=".22"/><path d="M150 40 L165 58 L158 56 L150 64 L142 56 L135 58Z" fill="#fff" opacity=".8"/></svg>
+        <svg class="jp-branch" viewBox="0 0 200 120"><path d="M0 30 C50 35 90 50 140 90 M60 40 C75 25 90 20 110 18 M100 62 C110 78 118 90 120 108" stroke="#4a2f22" stroke-width="3" fill="none" stroke-linecap="round"/><g fill="#f4a3bb"><circle cx="110" cy="18" r="6"/><circle cx="122" cy="20" r="5"/><circle cx="140" cy="90" r="7"/><circle cx="150" cy="84" r="5"/><circle cx="120" cy="108" r="6"/><circle cx="78" cy="30" r="5"/><circle cx="38" cy="33" r="4"/></g></svg>
+        <div class="jp-hanko">本棚</div><div class="jp-waves"></div><div class="jp-petals">${petals}</div>`;
+    },
+    grimoire(r) {
+      let stars = '', motes = '';
+      for (let i = 0; i < 36; i++) stars += `<i class="gr-star" style="left:${(r() * 100).toFixed(1)}%;top:${(r() * 45).toFixed(1)}%;animation-delay:-${(r() * 4).toFixed(1)}s;animation-duration:${(2 + r() * 3).toFixed(1)}s"></i>`;
+      for (let i = 0; i < 24; i++) { const z = (2 + r() * 3).toFixed(1); motes += `<i class="gr-mote" style="left:${(r() * 100).toFixed(1)}%;width:${z}px;height:${z}px;animation-duration:${(7 + r() * 7).toFixed(1)}s;animation-delay:-${(r() * 14).toFixed(1)}s"></i>`; }
+      const candle = (side) => `<div class="gr-candle ${side}"><i class="gr-flame"></i><b></b></div>`;
+      return `<div class="gr-sky"></div>${stars}<svg class="gr-runes" viewBox="0 0 300 300"><circle cx="150" cy="150" r="140" stroke="#d9b45a" fill="none" opacity=".5"/><circle cx="150" cy="150" r="118" stroke="#d9b45a" stroke-dasharray="2 8" fill="none" opacity=".6"/><circle cx="150" cy="150" r="96" stroke="#9f7bff" fill="none" opacity=".4"/><path d="M150 12 L270 220 L30 220Z M150 288 L30 80 L270 80Z" stroke="#d9b45a" fill="none" opacity=".35"/><path id="grc" d="M150 21 a129 129 0 1 1 -0.1 0" fill="none"/><text font-family="serif" font-size="14" fill="#d9b45a" opacity=".7"><textPath href="#grc">ᚠ ᚢ ᚦ ᚨ ᚱ ᚲ ᚷ ᚹ ᚺ ᚾ ᛁ ᛃ ᛇ ᛈ ᛉ ᛊ ᛏ ᛒ ᛖ ᛗ ᛚ ᛜ ᛞ ᛟ ᚠ ᚢ ᚦ ᚨ ᚱ ᚲ ᚷ</textPath></text></svg>${candle('l')}${candle('r')}<div class="gr-motes">${motes}</div><div class="gr-floor"></div>`;
+    },
+    lofi(r) {
+      let bokeh = '', drops = '';
+      const cols = ['#ff8fb1', '#ffd27a', '#8fd0ff', '#b59bff', '#ff9f6e'];
+      for (let i = 0; i < 14; i++) { const z = 18 + r() * 42 | 0; bokeh += `<i class="lf-bokeh" style="left:${(r() * 100 - 5).toFixed(1)}%;top:${(10 + r() * 50).toFixed(1)}%;width:${z}px;height:${z}px;background:${cols[i % 5]};animation-duration:${(3 + r() * 4).toFixed(1)}s;animation-delay:-${(r() * 6).toFixed(1)}s"></i>`; }
+      for (let i = 0; i < 24; i++) { const z = 3 + r() * 5; drops += `<i class="lf-drop" style="left:${(r() * 100).toFixed(1)}%;top:${(r() * 90 - 10).toFixed(1)}%;width:${z.toFixed(1)}px;height:${(z * 1.3).toFixed(1)}px;animation-duration:${(5 + r() * 7).toFixed(1)}s;animation-delay:-${(r() * 12).toFixed(1)}s"></i>`; }
+      return `<div class="lf-sky"></div><div class="lf-bokehs">${bokeh}</div><div class="lf-streak"></div><div class="lf-drops">${drops}</div><div class="lf-sill"></div>
+        <svg class="lf-cat" viewBox="0 0 70 62"><path d="M8 60 C6 40 14 28 26 26 L24 12 L32 22 C36 21 40 21 44 22 L52 12 L50 27 C58 32 60 44 58 60Z" fill="#0f0d1e"/><path class="lf-tail" d="M58 56 C70 52 72 40 64 34" stroke="#0f0d1e" stroke-width="6" fill="none" stroke-linecap="round"/><circle class="lf-eye" cx="32" cy="34" r="2.2" fill="#ffd27a"/><circle class="lf-eye" cx="44" cy="34" r="2.2" fill="#ffd27a"/></svg><div class="lf-grain"></div>`;
+    },
+    ocean(r) {
+      let bubbles = '', rays = '';
+      for (let i = 0; i < 22; i++) { const z = (4 + r() * 12).toFixed(1); bubbles += `<i class="oc-bub" style="left:${(r() * 100).toFixed(1)}%;width:${z}px;height:${z}px;animation-duration:${(6 + r() * 8).toFixed(1)}s,${(1.6 + r() * 2).toFixed(1)}s;animation-delay:-${(r() * 14).toFixed(1)}s,-${(r() * 3).toFixed(1)}s"></i>`; }
+      for (let i = 0; i < 6; i++) rays += `<i class="oc-ray" style="left:${(i * 18 - 6 + r() * 6).toFixed(1)}%;width:${(24 + r() * 40) | 0}px;animation-delay:-${(r() * 8).toFixed(1)}s;animation-duration:${(6 + r() * 5).toFixed(1)}s"></i>`;
+      const jelly = (cls, c) => `<svg class="oc-jelly ${cls}" viewBox="0 0 60 110"><path class="oc-bell" d="M6 34 C6 14 18 4 30 4 C42 4 54 14 54 34 C46 30 40 36 30 32 C20 36 14 30 6 34Z" fill="${c}" opacity=".75"/><g class="oc-tent" stroke="${c}" stroke-width="2" fill="none" opacity=".55" stroke-linecap="round"><path d="M14 34 C10 52 18 66 12 86"/><path d="M24 34 C22 56 30 74 24 104"/><path d="M36 34 C38 56 30 74 36 100"/><path d="M46 34 C50 52 42 66 48 84"/></g></svg>`;
+      return `<div class="oc-sea"></div><div class="oc-caustic"></div><div class="oc-rays">${rays}</div>${jelly('j1', '#ff9ed2')}${jelly('j2', '#9fe7ff')}
+        <svg class="oc-kelp l" viewBox="0 0 80 260"><path d="M20 260 C10 210 34 170 22 120 C12 80 30 40 24 0" stroke="#1f7a5c" stroke-width="9" fill="none" stroke-linecap="round"/><path d="M48 260 C58 220 36 190 50 150 C60 120 44 90 52 60" stroke="#2b9470" stroke-width="7" fill="none" stroke-linecap="round"/></svg>
+        <svg class="oc-kelp r" viewBox="0 0 80 260"><path d="M40 260 C30 210 54 170 42 120 C32 80 50 50 44 10" stroke="#2b9470" stroke-width="8" fill="none" stroke-linecap="round"/></svg>
+        <div class="oc-sand"></div><div class="oc-bubs">${bubbles}</div>`;
+    },
+  };
+  let sceneFor = '';
+  function renderScene() {
+    const id = curTheme();
+    if (id === sceneFor) return;
+    sceneFor = id;
+    const el = $('#scene'); if (!el) return;
+    const make = SCENES[id] || SCENES.bois;
+    el.innerHTML = make(seeded(id.length * 7919 + 13));
+    el.dataset.theme = id;
+  }
+  // animation d'entrée des étagères (au démarrage, en changeant de thème, de bibliothèque ou de disposition)
+  function animateShelves() {
+    const el = $('#libraryContent'); if (!el) return;
+    el.classList.remove('enter'); void el.offsetWidth; el.classList.add('enter');
+    clearTimeout(animateShelves.t); animateShelves.t = setTimeout(() => el.classList.remove('enter'), 1600);
+  }
+  function curTheme() { const t = state.settings.themes || {}; const id = t[curCat()] || state.settings.theme || 'bois'; return THEMES.some((x) => x.id === id) ? id : (OLD_THEME[id] || 'bois'); }
+  let lastTap = { x: innerWidth / 2, y: innerHeight / 2 };
+  document.addEventListener('pointerdown', (e) => { lastTap = { x: e.clientX, y: e.clientY }; }, true);
+  function pickTheme(id) {
+    if (id === curTheme()) return;
+    const go = () => { state.settings.themes = Object.assign({}, state.settings.themes, { [curCat()]: id }); save(); applyTheme(); render(); animateShelves(); };
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (!document.startViewTransition || reduce) return go();
+    document.documentElement.style.setProperty('--vt-x', lastTap.x + 'px');
+    document.documentElement.style.setProperty('--vt-y', lastTap.y + 'px');
+    document.startViewTransition(go);
+  }
   function openShelfPicker() {
     openSheet(`<h2>Étagère des ${CATS[curCat()].label.toLowerCase()}</h2>${themeCardsHTML()}<div class="sheet-actions"><button class="btn ghost block" data-act="close">Fermer</button></div>`);
-    $$('[data-pick-theme]', $('#sheetBody')).forEach((c) => c.onclick = () => { pickTheme(c.dataset.pickTheme); openShelfPicker(); });
+    $$('[data-pick-theme]', $('#sheetBody')).forEach((c) => c.onclick = () => { closeSheet(); pickTheme(c.dataset.pickTheme); });
   }
 
   // ---------- Bibliothèques Romans / Mangas ----------
@@ -550,7 +618,7 @@
   const catBooks = (cat = curCat()) => state.books.filter((b) => catOf(b) === cat);
   function setCat(cat) {
     if (cat === curCat() && state.settings.cat) return;
-    state.settings.cat = cat; saveLocal(); applyTheme(); libSig = ''; window.scrollTo(0, 0); render();
+    state.settings.cat = cat; saveLocal(); applyTheme(); libSig = ''; window.scrollTo(0, 0); render(); animateShelves();
   }
   function renderCatSwitch() {
     const el = $('#catSwitch'); if (!el) return;
@@ -697,7 +765,7 @@
       <div class="sheet-actions"><button class="btn block" id="decorBtn">🎨 Changer de décor</button>
       <button class="btn ghost block" data-act="close">Fermer</button></div>`);
     $$('[data-layout]', $('#sheetBody')).forEach((b) => b.onclick = () => {
-      state.settings.layout = b.dataset.layout; openPile = null; save(); closeSheet(); renderLibrary();
+      state.settings.layout = b.dataset.layout; openPile = null; save(); closeSheet(); libSig = ''; renderLibrary(); animateShelves();
       window.scrollTo({ top: 0 });
     });
     $('#decorBtn').onclick = openShelfPicker;
@@ -1128,6 +1196,7 @@
 
   function applyTheme() {
     document.body.dataset.theme = curTheme();
+    renderScene();
     const bg = getComputedStyle(document.body).getPropertyValue('--bg2').trim();
     $('meta[name="theme-color"]').setAttribute('content', bg || '#1f1712');
   }
@@ -1136,8 +1205,10 @@
   function openSheet(html) {
     $('#sheetBody').innerHTML = html;
     $('#sheetBackdrop').hidden = false;
+    document.body.style.setProperty('--sy', scrollY + 'px');
+    document.body.classList.add('sheet-open');
   }
-  function closeSheet() { $('#sheetBackdrop').hidden = true; $('#sheetBody').innerHTML = ''; }
+  function closeSheet() { $('#sheetBackdrop').hidden = true; $('#sheetBody').innerHTML = ''; document.body.classList.remove('sheet-open'); }
 
   function bookForm(b, { isNew }) {
     return `<h2>${isNew ? 'Ajouter un livre' : 'Compléter le livre'}</h2>
@@ -2230,6 +2301,7 @@
   applyTheme();
   wire();
   render();
+  animateShelves();
 
   // Synchro en ligne, puis sorties (recherchées automatiquement), puis rangement Romans / Mangas
   setTimeout(() => {

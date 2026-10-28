@@ -12,9 +12,12 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Bibliothèque">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@700&family=Comfortaa:wght@600;700&family=Cormorant+Garamond:wght@500;600;700&family=Fredoka:wght@500;600&family=Monoton&family=Nunito:wght@500;600;700&family=Quicksand:wght@500;600;700&family=Rajdhani:wght@500;600;700&family=Shippori+Mincho:wght@700;800&family=Zen+Kaku+Gothic+New:wght@500;700&display=swap">
   <link rel="stylesheet" href="style.css">
 </head>
 <body data-theme="bois">
+  <div id="scene" aria-hidden="true"></div>
   <header class="topbar">
     <h1 id="viewTitle">Ma bibliothèque</h1>
     <div class="topbar-sub" id="viewSub"></div>
@@ -63,7 +66,7 @@
     <section class="view" id="view-settings">
       <div class="card">
         <h3>Étagère et décor</h3>
-        <p class="muted small">Choisis l'ambiance de ta bibliothèque. Tu peux aussi changer d'étagère avec l'engrenage de l'écran Livres (Disposition → Changer de décor).</p>
+        <p class="muted small">Choisis l'ambiance de ta bibliothèque. Six ambiances animées. Tu peux aussi changer de décor avec le bouton Disposition de l'écran Livres.</p>
         <div class="themes" id="themePicker"></div>
       </div>
       <div class="card">
@@ -96,7 +99,7 @@
       </div>
       <div class="card">
         <h3>À propos</h3>
-        <p class="muted small" id="aboutText">Ma Bibliothèque — version 0.12.3. Couvertures : Amazon en priorité, puis Decitre, Leslibraires et la BnF.</p>
+        <p class="muted small" id="aboutText">Ma Bibliothèque — version 0.13. Couvertures : Amazon en priorité, puis Decitre, Leslibraires et la BnF.</p>
       </div>
     </section>
   </main>
