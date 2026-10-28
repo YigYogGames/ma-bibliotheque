@@ -767,7 +767,8 @@ async function releasesForSeries(name: string, books: any[], report: any) {
   return { list, failed: pdlFailed || pdlPartial };
 }
 const SERIES_TTL = 6 * 3600e3; // une série est revérifiée au plus toutes les 6 heures
-async function computeReleases(libraryId: string) {
+async function computeReleases(libraryId: string, force = false) {
+  const ttl = force ? 15 * 60e3 : SERIES_TTL; // « Actualiser » : chaque série revérifiée si elle date de plus de 15 min
   const { data: rows } = await db.from("library_books").select("data").eq("library_id", libraryId).eq("deleted", false);
   const books = (rows || []).map((r) => r.data).filter(Boolean);
   const groups = new Map<string, { name: string; books: any[] }>();
@@ -799,7 +800,7 @@ async function computeReleases(libraryId: string) {
       const key = norm(s.name) + "|" + pubWord(last?.publisher || "") + "|" + maxOwned;
       const { data: cached } = await db.from("series_cache").select("data, checked_at").eq("key", key).maybeSingle();
       let list: any[];
-      if (cached && Date.now() - new Date(cached.checked_at).getTime() < SERIES_TTL) list = cached.data || [];
+      if (cached && Date.now() - new Date(cached.checked_at).getTime() < ttl) list = cached.data || [];
       else {
         const res = await releasesForSeries(s.name, s.books, report);
         list = res.list;
@@ -1077,7 +1078,7 @@ Deno.serve(async (req) => {
         refreshing = true;
         await db.from("library_releases").upsert({ library_id: body.id, releases: cur?.releases || [], report: cur?.report || null,
           checked_at: cur?.checked_at || null, running_since: new Date().toISOString() });
-        const task = computeReleases(body.id).catch(async () => {
+        const task = computeReleases(body.id, !!body.force).catch(async () => {
           await db.from("library_releases").update({ running_since: null }).eq("library_id", body.id);
         });
         // @ts-ignore EdgeRuntime existe sur Supabase

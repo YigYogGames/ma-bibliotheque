@@ -851,3 +851,10 @@ body.sheet-open .topbar { transform-origin: 50% 35vh; }
 @keyframes ocWobble { from { margin-left: -6px; } to { margin-left: 6px; } }
 .theme-card .tc-name { background: none; padding: 0; position: static; border-radius: 0; color: inherit; }
 .theme-card .tc-desc { color: inherit; }
+
+/* bouton Actualiser des sorties (v0.13.1) */
+.releases-head { display: flex; gap: 8px; flex-wrap: wrap; }
+#refreshRelBtn { display: inline-flex; align-items: center; gap: 8px; }
+#refreshRelBtn svg { width: 18px; height: 18px; }
+#refreshRelBtn.spinning svg { animation: spin .9s linear infinite; }
+#refreshRelBtn:disabled { opacity: .75; }

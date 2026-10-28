@@ -671,6 +671,7 @@
   let currentView = 'library';
   function show(view) {
     currentView = view;
+    if (view === 'releases') refreshReleases(false);
     $$('.view').forEach((v) => v.classList.toggle('active', v.id === 'view-' + view));
     $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === view));
     window.scrollTo(0, 0);
@@ -1143,6 +1144,7 @@
     $('#lastCheck').textContent = state.lastCheck ? 'Dernière recherche : ' + new Date(state.lastCheck).toLocaleString('fr-FR', { dateStyle: 'medium', timeStyle: 'short' }) + auto + rpTxt : '';
     const st = $('#relStatus');
     if (st) st.hidden = !state.releasesRefreshing;
+    const rb = $('#refreshRelBtn'); if (rb) { rb.classList.toggle('spinning', !!state.releasesRefreshing); rb.disabled = !!state.releasesRefreshing; }
     if (!seriesInCat().length) {
       el.innerHTML = `<div class="empty"><div class="big">📅</div><h2>Pas encore de série</h2><p>Ajoute des livres qui font partie d'une série, puis reviens ici : je chercherai les prochains tomes et leurs dates de sortie.</p></div>`;
       return;
@@ -2131,11 +2133,11 @@
     saveLocal();
     scheduleRender();
   }
-  async function loadServerReleases(refresh) {
+  async function loadServerReleases(refresh, force) {
     if (!state.sync || !state.sync.id) await syncNow();
     if (!state.sync || !state.sync.id || state.sync.error) throw new Error('serveur indisponible');
     if (state.lastCheckSeries !== seriesKeySig()) refresh = true; // une série a changé : on recalcule
-    const r = await api('releases', { id: state.sync.id, secret: state.sync.secret, refresh: !!refresh }, 30000);
+    const r = await api('releases', { id: state.sync.id, secret: state.sync.secret, refresh: !!refresh, force: !!force }, 30000);
     state.lastCheckSeries = seriesKeySig();
     applyReleases(r);
     clearTimeout(relPoll);
@@ -2156,6 +2158,15 @@
   function autoReleases() {
     if (!seriesList().length) return;
     loadServerReleases(false).catch(() => { state.releasesRefreshing = false; scheduleRender(); });
+  }
+  // Bouton « Actualiser », et ouverture de l'onglet Sorties : nouvelle vérification chez les libraires
+  function refreshReleases(manual) {
+    if (!seriesList().length) { if (manual) toast('Ajoute une série pour voir ses sorties'); return; }
+    if (state.releasesRefreshing) { if (manual) toast('Vérification déjà en cours…'); return; }
+    // en ouvrant l'onglet : seulement si la dernière vérification date de plus de 10 minutes
+    if (!manual && state.lastCheck && Date.now() - state.lastCheck < 10 * 60e3) return autoReleases();
+    state.releasesRefreshing = true; scheduleRender();
+    loadServerReleases(true, true).catch(() => { state.releasesRefreshing = false; scheduleRender(); if (manual) toast('Serveur injoignable, réessaie dans un instant'); });
   }
 
   // ---------- Recherche des sorties ----------
@@ -2233,6 +2244,7 @@
     $('#sortBtn').addEventListener('click', openSortMenu);
     $('#layoutBtn').addEventListener('click', openLayoutMenu);
     $('#addReleaseBtn').addEventListener('click', addReleaseManually);
+    $('#refreshRelBtn').addEventListener('click', () => refreshReleases(true));
     $('#manualIsbnBtn').addEventListener('click', () => askIsbn());
     $('#searchAddBtn').addEventListener('click', () => openAddSearch(''));
     $('#manualBookBtn').addEventListener('click', () => {
