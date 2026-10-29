@@ -23,10 +23,20 @@
   function saveLocal() {
     try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { toast("Impossible d'enregistrer"); }
   }
+  // plusieurs changements rapprochés = une seule écriture (l'écriture bloque l'écran sur les gros volumes)
+  let saveTimer = 0;
   function save() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(flushSave, 400);
+  }
+  function flushSave() {
+    clearTimeout(saveTimer); saveTimer = 0;
     saveLocal();
     if (typeof scheduleSync === 'function') scheduleSync();
   }
+  // l'appli passe en arrière-plan ou se ferme : on écrit tout de suite
+  addEventListener('pagehide', () => { if (saveTimer) flushSave(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden && saveTimer) flushSave(); });
 
   // ---------- Outils ----------
   const $ = (s, el = document) => el.querySelector(s);
@@ -392,20 +402,20 @@
     if (changed) scheduleRender();
   }
   const VIEW_BOX = typeof CSS !== 'undefined' && CSS.supports && CSS.supports('object-view-box', 'inset(1% 1% 1% 1%)');
-  function croppedImg(b, attrs) {
+  function croppedImg(b, src, attrs) {
     const c = b.cropFor === b.cover && Array.isArray(b.coverCrop) ? b.coverCrop : null;
-    if (!c) return `<img src="${esc(b.cover)}" ${attrs}>`;
+    if (!c) return `<img src="${esc(src)}" ${attrs}>`;
     const [l, t, r, bt] = c.map((x) => Math.max(0, Math.min(0.4, +x || 0)));
-    if (VIEW_BOX) return `<img src="${esc(b.cover)}" style="object-view-box:inset(${t * 100}% ${r * 100}% ${bt * 100}% ${l * 100}%)" ${attrs}>`;
+    if (VIEW_BOX) return `<img src="${esc(src)}" style="object-view-box:inset(${t * 100}% ${r * 100}% ${bt * 100}% ${l * 100}%)" ${attrs}>`;
     const w = 1 - l - r, h = 1 - t - bt;
-    return `<span class="crop-wrap"><img src="${esc(b.cover)}" style="position:absolute;max-width:none;object-fit:fill;width:${(100 / w).toFixed(2)}%;height:${(100 / h).toFixed(2)}%;left:${(-l / w * 100).toFixed(2)}%;top:${(-t / h * 100).toFixed(2)}%" ${attrs}></span>`;
+    return `<span class="crop-wrap"><img src="${esc(src)}" style="position:absolute;max-width:none;object-fit:fill;width:${(100 / w).toFixed(2)}%;height:${(100 / h).toFixed(2)}%;left:${(-l / w * 100).toFixed(2)}%;top:${(-t / h * 100).toFixed(2)}%" ${attrs}></span>`;
   }
   function coverLater(b) {
     if (!b.isbn || b.coverPhoto || b.cover) return;
     findCoverAny(b.isbn, b.ark, b).then((u) => {
       if (!u) return;
       b.cover = u; b.coverTriedAt = Date.now();
-      const pv = $('#previewCover'); if (pv) pv.innerHTML = coverHTML(b);
+      const pv = $('#previewCover'); if (pv) pv.innerHTML = coverHTML(b, true);
       const bd = $('.book-card'); if (bd && !$('.bc-backdrop', bd)) bd.insertAdjacentHTML('afterbegin', `<div class="bc-backdrop" aria-hidden="true"><img src="${esc(u)}" alt=""></div>`);
       if (state.books.includes(b)) { save(); scheduleRender(); }
     }).catch(() => {});
@@ -504,10 +514,19 @@
     let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360;
     return `linear-gradient(160deg, hsl(${h} 45% 42%), hsl(${(h + 30) % 360} 50% 24%))`;
   }
-  function coverHTML(b) {
+  // même image en taille réduite pour les vignettes : 6 fois moins lourde à charger et à afficher
+  function thumbUrl(u, size) {
+    if (!u) return u;
+    let m = u.match(/^(https:\/\/images-na\.ssl-images-amazon\.com\/images\/P\/[0-9X]{10}\.01)\.LZZZZZZZ\.jpg$/);
+    if (m) return m[1] + '._SX' + size + '_.jpg';
+    m = u.match(/^(https:\/\/m\.media-amazon\.com\/images\/I\/[^.]+)\._[A-Z]{2}\d+_\.(jpg|png)$/);
+    if (m) return m[1] + '._SX' + size + '_.' + m[2];
+    return u;
+  }
+  function coverHTML(b, big) {
     const fake = `<div class="fake-cover" style="background:${hashColor(b.series || b.title)}"><div class="fc-title">${esc(b.title || 'Sans titre')}</div><div class="fc-author">${esc(b.authors || '')}</div></div>`;
     if (!b.cover) return fake;
-    return croppedImg(b, `alt="" loading="lazy" decoding="async" onerror="window.__badCover(this)" data-id="${esc(b.id || '')}" data-fb="${esc(fake)}"`);
+    return croppedImg(b, big ? b.cover : thumbUrl(b.cover, 300), `alt="" loading="lazy" decoding="async" onerror="window.__badCover(this)" data-id="${esc(b.id || '')}" data-fb="${esc(fake)}"`);
   }
 
   // Image de couverture qui ne s'affiche pas : on met la couverture de secours et on cherche une autre source
@@ -604,6 +623,13 @@
     clearTimeout(animateShelves.t); animateShelves.t = setTimeout(() => el.classList.remove('enter'), 1600);
   }
   function curTheme() { const t = state.settings.themes || {}; const id = t[curCat()] || state.settings.theme || 'bois'; return THEMES.some((x) => x.id === id) ? id : (OLD_THEME[id] || 'bois'); }
+  // pendant le défilement, le décor animé se met en pause (le téléphone garde toute sa force pour défiler)
+  let scrollT = 0;
+  addEventListener('scroll', () => {
+    const sc = document.getElementById('scene');
+    if (!scrollT && sc) sc.classList.add('paused');
+    clearTimeout(scrollT); scrollT = setTimeout(() => { scrollT = 0; if (sc) sc.classList.remove('paused'); }, 180);
+  }, { passive: true });
   let lastTap = { x: innerWidth / 2, y: innerHeight / 2 };
   document.addEventListener('pointerdown', (e) => { lastTap = { x: e.clientX, y: e.clientY }; }, true);
   function pickTheme(id) {
@@ -883,43 +909,93 @@
     const total = Math.max(info.fr, owned);
     return { owned, total, pct: Math.min(100, Math.round(owned / total * 100)), status: info.status, info };
   }
-  function seriesShelvesHTML(list) {
+  function progHTML(g) {
+    const pr = seriesProgress(g.name, g.books);
+    if (pr) return `<div class="s-prog"><div class="s-prog-row"><span>${pr.owned} sur ${pr.total} parus en France</span>${pr.status ? `<span class="s-pill ${pr.status === 'Terminée' ? 'done' : ''}">${pr.status}</span>` : ''}</div>
+          <div class="s-bar ${pr.status === 'Terminée' ? 'done' : ''}"><i style="width:${pr.pct}%"></i></div></div>`;
+    // pas encore d'infos : emplacement réservé (la carte ne change pas de taille quand elles arrivent)
+    const info = (state.seriesInfo || {})[g.key];
+    if (info === undefined || (info && info.partial)) return `<div class="s-prog s-wait" aria-hidden="true"><div class="s-prog-row"><span class="s-skel"></span></div><div class="s-bar"><i></i></div></div>`;
+    return '';
+  }
+  function seriesCardParts(list) {
     const { groups, loose } = groupBySeries(list);
-    const cards = groups.map((g) => {
+    const parts = groups.map((g) => {
       const n = g.books.length;
-      const pr = seriesProgress(g.name, g.books);
       const bg = (g.books.find((b) => b.cover && !b.coverPhoto) || g.books.find((b) => b.cover) || {}).cover;
-      return `<section class="s-card">
-        ${bg ? `<img class="s-bg" src="${esc(bg)}" alt="" aria-hidden="true">` : ''}
+      return { k: g.key, prog: progHTML(g), html: `<section class="s-card" data-k="${esc(g.key)}">
+        ${bg ? `<img class="s-bg" src="${esc(thumbUrl(bg, 60))}" alt="" aria-hidden="true" loading="lazy" decoding="async">` : ''}
         <div class="s-top"><div class="s-names"><b>${esc(g.name)}</b><span>${n} tome${n > 1 ? 's' : ''}</span></div>
           <button class="s-open" data-series-open="${esc(g.key)}" aria-label="Voir la série ${esc(g.name)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button></div>
         <div class="series-scroll">${g.books.map(bookHTML).join('')}</div>
-        ${pr ? `<div class="s-prog"><div class="s-prog-row"><span>${pr.owned} sur ${pr.total} parus en France</span>${pr.status ? `<span class="s-pill ${pr.status === 'Terminée' ? 'done' : ''}">${pr.status}</span>` : ''}</div>
-          <div class="s-bar ${pr.status === 'Terminée' ? 'done' : ''}"><i style="width:${pr.pct}%"></i></div></div>` : ''}
-      </section>`;
+        <div class="s-prog-slot"></div>
+      </section>` };
     });
-    if (loose.length) cards.push(`<section class="s-card"><div class="s-top"><div class="s-names"><b>Autres livres</b><span>${loose.length} livre${loose.length > 1 ? 's' : ''}</span></div></div>
-      <div class="series-scroll">${loose.map(bookHTML).join('')}</div></section>`);
-    return '<div class="s-cards">' + cards.join('') + '</div>';
+    if (loose.length) parts.push({ k: '\u0000autres', prog: '', html: `<section class="s-card" data-k="\u0000autres"><div class="s-top"><div class="s-names"><b>Autres livres</b><span>${loose.length} livre${loose.length > 1 ? 's' : ''}</span></div></div>
+      <div class="series-scroll">${loose.map(bookHTML).join('')}</div></section>` });
+    return parts;
+  }
+  // ne remplace que les cartes qui ont changé : les autres (et leurs images) restent en place
+  function patchSeriesCards(el, parts) {
+    let root = el.firstElementChild;
+    if (!root || !root.classList.contains('s-cards') || el.childElementCount !== 1) { el.innerHTML = '<div class="s-cards"></div>'; root = el.firstElementChild; }
+    const old = new Map();
+    for (const n of root.children) old.set(n.dataset.k, n);
+    const tpl = document.createElement('template');
+    let ref = root.firstElementChild;
+    for (const c of parts) {
+      let n = old.get(c.k);
+      if (n && n.__h === c.html) old.delete(c.k);
+      else { tpl.innerHTML = c.html.trim(); n = tpl.content.firstElementChild; n.__h = c.html; }
+      if (n === ref) ref = ref.nextElementSibling; else root.insertBefore(n, ref);
+      const slot = n.querySelector('.s-prog-slot');
+      if (slot && slot.__p !== c.prog) { slot.innerHTML = c.prog; slot.__p = c.prog; }
+    }
+    for (const n of old.values()) n.remove();
   }
 
   // Infos des séries (tomes parus en France, parution d'origine, statut) : demandées au serveur en arrière-plan
   let infoVer = 0, infoLoading = false;
-  async function loadSeriesInfo(force) {
+  async function loadSeriesInfo(force, round = 0) {
     if (infoLoading) return;
     infoLoading = true;
+    let pending = 0;
     try {
       state.seriesInfo = state.seriesInfo || {};
+      const todo = [];
       for (const s of seriesList()) {
         const maxOwned = Math.max(0, ...s.books.map((b) => b.volume || 0));
         const cur = state.seriesInfo[s.key];
-        if (!force && cur && cur.maxOwned === maxOwned && Date.now() - (cur.at || 0) < 3 * 864e5) continue;
-        try {
-          const r = await api('seriesInfo', { series: s.name, books: s.books.map((b) => ({ isbn: b.isbn, volume: b.volume, publisher: b.publisher, category: b.category, format: b.format })) }, 120000);
-          if (r && r.info) { state.seriesInfo[s.key] = Object.assign({}, r.info, { maxOwned, at: Date.now() }); infoVer++; save(); scheduleRender(); }
-        } catch (e) { break; } // serveur injoignable : on réessaiera plus tard
+        if (!force && cur && !cur.partial && cur.maxOwned === maxOwned && Date.now() - (cur.at || 0) < 3 * 864e5) continue;
+        todo.push({ s, maxOwned });
       }
+      if (!todo.length) return;
+      let r = null;
+      try {
+        r = await api('seriesInfoMany', { items: todo.map(({ s, maxOwned }) => ({ key: s.key, name: s.name, publisher: s.books[0].publisher || '', maxOwned,
+          books: s.books.map((b) => ({ isbn: b.isbn, volume: b.volume, publisher: b.publisher, category: b.category, format: b.format })) })) }, 30000);
+      } catch (e) { r = null; }
+      if (r && r.infos) {
+        for (const { s, maxOwned } of todo) {
+          const info = r.infos[s.key];
+          if (info) state.seriesInfo[s.key] = Object.assign({}, info, { maxOwned, at: info.partial ? 0 : Date.now() });
+          else if (!info && !r.pendingKeys?.includes(s.key)) state.seriesInfo[s.key] = { maxOwned, at: Date.now(), none: true };
+        }
+        pending = r.pending || 0;
+      } else {
+        // ancien serveur ou pas de réseau : une série à la fois, comme avant, mais un seul dessin à la fin de chaque paquet
+        for (let i = 0; i < todo.length; i += 4) {
+          const part = todo.slice(i, i + 4);
+          const got = await Promise.all(part.map(({ s }) => api('seriesInfo', { series: s.name, books: s.books.map((b) => ({ isbn: b.isbn, volume: b.volume, publisher: b.publisher, category: b.category, format: b.format })) }, 120000).catch(() => null)));
+          if (got.every((x) => !x)) break;
+          part.forEach(({ s, maxOwned }, j) => { if (got[j] && got[j].info) state.seriesInfo[s.key] = Object.assign({}, got[j].info, { maxOwned, at: Date.now() }); });
+          infoVer++; save(); scheduleRender();
+        }
+      }
+      infoVer++; save(); scheduleRender();
     } finally { infoLoading = false; }
+    // le serveur prépare les séries qu'il ne connaissait pas : on revient chercher le résultat
+    if (pending && round < 6) setTimeout(() => loadSeriesInfo(false, round + 1).catch(() => {}), 40000);
   }
 
   // Page d'une série : progression de ta collection, parution en France et dans le pays d'origine, tomes manquants
@@ -964,9 +1040,9 @@
     for (const b of books.filter((x) => !x.volume)) grid.push(bookHTML(b));
     const status = info && info.status;
     openSheet(`<div class="book-card sd">
-        ${covers[0] ? `<div class="bc-backdrop" aria-hidden="true"><img src="${esc(covers[0].cover)}" alt=""></div>` : ''}
+        ${covers[0] ? `<div class="bc-backdrop" aria-hidden="true"><img src="${esc(thumbUrl(covers[0].cover, 120))}" alt=""></div>` : ''}
         <div class="sd-head">
-          <div class="sd-fan">${covers.slice(1, 3).map((b, i) => `<img class="f${i + 1}" src="${esc(b.cover)}" alt="">`).join('')}${covers[0] ? `<img class="f0" src="${esc(covers[0].cover)}" alt="">` : ''}</div>
+          <div class="sd-fan">${covers.slice(1, 3).map((b, i) => `<img class="f${i + 1}" src="${esc(thumbUrl(b.cover, 300))}" alt="">`).join('')}${covers[0] ? `<img class="f0" src="${esc(thumbUrl(covers[0].cover, 300))}" alt="">` : ''}</div>
           <h2 class="bc-title">${esc(s.name)}</h2>
           <div class="bc-authors">${esc([first.authors, first.publisher].filter(Boolean).join(' · '))}</div>
           <div class="bc-chips">${first.format ? `<span>${esc(first.format)}</span>` : ''}${status ? `<span class="${status === 'Terminée' ? 'st-done' : 'st-on'}">${status}</span>` : ''}</div>
@@ -1124,11 +1200,12 @@
     if (!list.length) { libSig = ''; el.innerHTML = `<p class="lib-none">« ${esc($('#searchInput').value.trim())} » n’est pas dans ta bibliothèque.</p>`; updateOnlineHint(); return; }
     updateOnlineHint();
     const layout = state.settings.layout;
-    const sig = [layout, openPile, infoVer, curTheme(), window.innerWidth, list.map((b) => b.id + ':' + (b.cover || '') + ':' + b.volume + ':' + (b.title || '')).join(',')].join('|');
+    const sig = [layout, openPile, layout === 'series' ? infoVer : 0, curTheme(), window.innerWidth, list.map((b) => b.id + ':' + (b.cover || '') + ':' + b.volume + ':' + (b.title || '')).join(',')].join('|');
     if (sig === libSig && el.childElementCount) return;
     libSig = sig;
 
-    if (layout === 'series' || layout === 'group') { el.innerHTML = layout === 'series' ? seriesShelvesHTML(list) : groupedShelvesHTML(list); return; }
+    if (layout === 'series') { patchSeriesCards(el, seriesCardParts(list)); return; }
+    if (layout === 'group') { el.innerHTML = groupedShelvesHTML(list); return; }
     if (layout === 'list') {
       el.innerHTML = '<div class="list">' + list.map((b) => `
         <div class="list-item" data-id="${b.id}">
@@ -1291,9 +1368,9 @@
   }
   function closeSheet() { $('#sheetBackdrop').hidden = true; $('#sheetBody').innerHTML = ''; document.body.classList.remove('sheet-open'); }
 
-  function bookForm(b, { isNew }) {
+  function bookForm(b, { isNew, fromScan }) {
     return `<h2>${isNew ? 'Ajouter un livre' : 'Compléter le livre'}</h2>
-      ${isNew && b.cover ? `<div class="detail-top" style="margin-bottom:12px"><div class="detail-cover">${coverHTML(b)}</div><div class="detail-meta"><div class="kv">ISBN <b>${esc(b.isbn)}</b></div><div class="kv">${esc(b.publisher || '')}</div><div class="kv">${b.publishedDate ? 'Paru : ' + fmtDate(b.publishedDate) : ''}</div></div></div>` : ''}
+      ${isNew && b.cover ? `<div class="detail-top" style="margin-bottom:12px"><div class="detail-cover">${coverHTML(b, true)}</div><div class="detail-meta"><div class="kv">ISBN <b>${esc(b.isbn)}</b></div><div class="kv">${esc(b.publisher || '')}</div><div class="kv">${b.publishedDate ? 'Paru : ' + fmtDate(b.publishedDate) : ''}</div></div></div>` : ''}
       <form class="form" id="bookForm" autocomplete="off">
         <label>Titre<input type="text" name="title" value="${esc(b.title)}" required></label>
         <label>Auteur(s)<input type="text" name="authors" value="${esc(b.authors)}"></label>
@@ -1304,13 +1381,13 @@
         <datalist id="seriesNames">${seriesList().map((s) => `<option value="${esc(s.name)}">`).join('')}</datalist>
         <div class="two">
           <label>Éditeur<input type="text" name="publisher" value="${esc(b.publisher)}"></label>
-          <label>Parution<input type="text" name="publishedDate" value="${esc(b.publishedDate)}" placeholder="AAAA-MM-JJ"></label>
+          <label>Parution<input type="text" name="publishedDate" value="${esc(b.publishedDate)}" placeholder="ex. 2024"></label>
         </div>
         <label>ISBN<input type="text" name="isbn" inputmode="numeric" value="${esc(b.isbn)}"></label>
         ${isNew ? catPickerHTML(detectedCat(b)) : ''}
         <div class="sheet-actions">
           <button class="btn primary block" type="submit">${isNew ? '＋ Ajouter à ma bibliothèque' : 'Enregistrer'}</button>
-          ${isNew ? '<button class="btn block" type="button" data-act="scan-again">Annuler et scanner un autre</button>' : ''}
+          ${isNew && fromScan ? '<button class="btn block" type="button" data-act="scan-again">Annuler et scanner un autre</button>' : ''}
           <button class="btn ghost block" type="button" data-act="close">Annuler</button>
         </div>
       </form>`;
@@ -1353,9 +1430,9 @@
       tile('Dans ta bibliothèque', added ? 'depuis le ' + added : ''), tile('ISBN', esc(b.isbn))].filter(Boolean).join('');
     const long = (b.description || '').length > 220;
     return `<div class="book-card">
-      ${b.cover ? `<div class="bc-backdrop" aria-hidden="true"><img src="${esc(b.cover)}" alt=""></div>` : ''}
+      ${b.cover ? `<div class="bc-backdrop" aria-hidden="true"><img src="${esc(thumbUrl(b.cover, 120))}" alt=""></div>` : ''}
       <div class="bc-head">
-        <div class="bc-cover" id="previewCover">${coverHTML(b)}</div>
+        <div class="bc-cover" id="previewCover">${coverHTML(b, true)}</div>
         <h2 class="bc-title">${esc(name)}</h2>
         ${hasSeries ? `<div class="bc-vol">Tome ${b.volume}${part ? ' · ' + esc(part) : ''}</div>` : ''}
         <div class="bc-authors">${esc(b.authors || 'Auteur inconnu')}</div>
@@ -2214,14 +2291,14 @@
       <button class="btn block" type="button" id="retryLookup" style="margin-bottom:10px">↻ Réessayer la recherche</button>
       <p class="muted small" style="font-size:11px;opacity:.8">${esc(lastLookupReport.join(' · '))}</p><p class="muted small">Ou remplis les infos toi-même :</p>`;
     if (found) { confirmAdd(b); coverLater(b); return; }
-    openSheet(notFound + bookForm(b, { isNew: true }));
+    openSheet(notFound + bookForm(b, { isNew: true, fromScan: true }));
     wireBookForm(b, true);
     const rb = $('#retryLookup'); if (rb) rb.addEventListener('click', () => handleCode(n13));
   }
 
   // ---------- Choix de la couverture ----------
   function coverMenu(b, onDone) {
-    openSheet(`<h2>Couverture</h2><div style="display:flex;justify-content:center;margin-bottom:12px"><div class="detail-cover">${coverHTML(b)}</div></div>
+    openSheet(`<h2>Couverture</h2><div style="display:flex;justify-content:center;margin-bottom:12px"><div class="detail-cover">${coverHTML(b, true)}</div></div>
       <div class="sheet-actions">
         <button class="btn primary block" id="cvPhoto">📷 Prendre en photo / choisir une image</button>
         ${b.isbn ? '<button class="btn block" id="cvSearch">🔎 Chercher automatiquement</button>' : ''}

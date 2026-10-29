@@ -1234,6 +1234,43 @@ async function seriesInfo(name: string, books: any[]) {
   return info;
 }
 
+// Infos de toutes les séries d'une bibliothèque en une fois : ce qui est connu tout de suite,
+// le reste (avec le dernier tome du catalogue en attendant) est préparé en arrière-plan
+async function seriesInfoMany(items: any[]) {
+  const infos: Record<string, any> = {};
+  const list = items.slice(0, 500).filter((it) => it && it.name);
+  const infoKey = (it: any) => "info|" + norm(it.name) + "|" + pubWord(it.publisher || "") + "|" + (+it.maxOwned || 0);
+  const cached = new Map<string, any>(), cat = new Map<string, any>();
+  const k1 = list.map(infoKey), k2 = list.map((it) => catKey(it.name, it.publisher));
+  for (let i = 0; i < list.length; i += 150) {
+    const [{ data: a }, { data: b }] = await Promise.all([
+      db.from("series_cache").select("key, data, checked_at").in("key", k1.slice(i, i + 150)),
+      db.from("catalog_series").select("key, latest").in("key", k2.slice(i, i + 150)),
+    ]);
+    for (const r of a || []) cached.set(r.key, r);
+    for (const r of b || []) cat.set(r.key, r);
+  }
+  const missing: any[] = [];
+  list.forEach((it, i) => {
+    const c = cached.get(k1[i]);
+    const k = it.key || norm(it.name);
+    if (c && Date.now() - new Date(c.checked_at).getTime() < INFO_TTL) { infos[k] = c.data; return; }
+    const latest = cat.get(k2[i])?.latest;
+    infos[k] = latest ? { fr: Math.max(latest, +it.maxOwned || 0), partial: true } : null;
+    missing.push(it);
+  });
+  // préparation en arrière-plan, 3 séries à la fois
+  if (missing.length) {
+    const work = missing.slice(0, 60);
+    const task = Promise.all([0, 1, 2].map(async () => {
+      while (work.length) { const it = work.shift(); try { await seriesInfo(String(it.name), Array.isArray(it.books) ? it.books.slice(0, 300) : []); } catch { /* suivante */ } }
+    }));
+    // @ts-ignore EdgeRuntime existe sur Supabase
+    if (typeof EdgeRuntime !== "undefined" && EdgeRuntime.waitUntil) EdgeRuntime.waitUntil(task);
+  }
+  return { infos, pending: missing.length, pendingKeys: missing.map((it) => it.key || norm(it.name)) };
+}
+
 // ---------- Recherche par titre (ajout sans code-barres) ----------
 // « solo » -> Solo Leveling (regroupé en série, tous les tomes trouvés), puis les autres livres dont le titre contient « solo »
 const SEARCH_TTL = 864e5;
@@ -1470,6 +1507,7 @@ Deno.serve(async (req) => {
       return json({ crops });
     }
     if (action === "search") return json(await searchBooks(body.adv ? body : String(body.q || "")));
+    if (action === "seriesInfoMany") return json(await seriesInfoMany(Array.isArray(body.items) ? body.items : []));
     if (action === "seriesInfo") return json({ info: await seriesInfo(String(body.series || ""), Array.isArray(body.books) ? body.books.slice(0, 300) : []) });
     if (action === "volumes") return json({ volumes: await volumes(String(body.series || ""), (body.volumes || []).map(Number).filter((n: number) => n > 0), String(body.publisher || ""), String(body.refIsbn || "")) });
 

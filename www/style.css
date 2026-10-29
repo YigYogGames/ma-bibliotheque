@@ -287,7 +287,9 @@ html.scanning body > *:not(#scanOverlay) { visibility: hidden; }
 
 /* ===== Fluidité ===== */
 button, .book, .tab, .list-item, .rel, .theme-card, .cat-btn { touch-action: manipulation; }
-.shelf-row, .list-item, .series-card, .rel { content-visibility: auto; contain-intrinsic-size: auto 180px; }
+.shelf-row, .series-card { content-visibility: auto; contain-intrinsic-size: auto 180px; }
+/* une colonne qui ne s'élargit jamais à cause d'un long titre */
+.list, .s-cards, .rel-list { grid-template-columns: minmax(0, 1fr); }
 .book img, .thumb img { background: var(--surface2); }
 .sheet { will-change: transform; }
 .view.active { animation-duration: .12s; }
@@ -900,3 +902,27 @@ html.scanning body::after { display: none; }
 .bc-why { margin: 14px 2px 0; font-size: 13px; color: var(--muted); }
 .bc-why summary { cursor: pointer; font-weight: 600; color: var(--text); opacity: .85; }
 .bc-why ul { margin: 8px 0 6px; padding-left: 18px; line-height: 1.5; }
+
+/* ===== v0.17 : fluidité ===== */
+/* fond flouté des cartes : on floute une petite image puis la carte graphique l'agrandit (même rendu, beaucoup moins de calcul) */
+.s-bg { inset: auto; left: -6%; top: -6%; width: 28%; height: 28%; transform: scale(4.3); transform-origin: 0 0; filter: blur(3px) saturate(1.15); will-change: transform; }
+.s-card { contain: layout paint style; }
+/* les barres floutées fixes recalculaient le flou de tout ce qui défile derrière à chaque image */
+.tabbar, [data-theme="neon"] .tabbar { backdrop-filter: none; -webkit-backdrop-filter: none; background: color-mix(in srgb, var(--bg2) 97%, transparent); }
+body::after { backdrop-filter: none; -webkit-backdrop-filter: none; background: color-mix(in srgb, var(--bg2) 92%, transparent); }
+/* fenêtre ouverte : on assombrit sans filtre (le filtre forçait à redessiner toute la page) */
+body.sheet-open #main, body.sheet-open .topbar { filter: none; }
+/* néon : la lueur clignote par l'opacité d'une couche (fluide) au lieu de recalculer l'ombre de chaque carte */
+[data-theme="neon"] .s-card, .enter [data-theme="neon"] .s-card, [data-theme="neon"] .enter .s-card { animation: none; box-shadow: 0 0 0 1px rgba(255,79,163,.55), 0 0 14px rgba(255,47,180,.3); }
+[data-theme="neon"] .enter .s-card { animation: shelfIn .65s cubic-bezier(.2,.8,.2,1) both; }
+/* décor animé en pause pendant le défilement et quand une fenêtre est ouverte */
+#scene.paused *, body.sheet-open #scene * { animation-play-state: paused !important; }
+/* animation d'entrée : seulement les premières cartes visibles */
+.enter .s-card:nth-child(n+7), .enter .shelf-row:nth-child(n+8), .enter .list-item:nth-child(n+12) { animation: none !important; }
+.enter .s-card:nth-child(n+7) .book, .enter .s-card:nth-child(n+7) .s-bar i { animation: none !important; }
+/* emplacement de la barre de progression en attendant les infos */
+.s-wait .s-skel { display: inline-block; width: 150px; height: 12px; border-radius: 6px; background: rgba(255,255,255,.12); }
+.s-wait .s-bar i { width: 35%; background: rgba(255,255,255,.12); animation: skel 1.4s ease-in-out infinite; }
+@keyframes skel { 0%, 100% { opacity: .4; } 50% { opacity: .9; } }
+.shelf-row { content-visibility: auto; contain-intrinsic-size: auto 170px; }
+
